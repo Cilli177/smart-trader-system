@@ -3,15 +3,34 @@ using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Pega a porta do ambiente (necessário para o Railway depois) ou usa 5000 local
+// --- 1. CONFIGURAÇÃO DE SERVIÇOS (Injeção de Dependência) ---
+
+// Pega a string de conexão
+var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
+
+// [NOVO] Registra o NpgsqlDataSource. 
+// Isso é vital para o NewsController que criamos receber a conexão automaticamente.
+builder.Services.AddNpgsqlDataSource(connectionString!);
+
+// [NOVO] Habilita o uso de Controllers (arquivos separados na pasta Controllers)
+builder.Services.AddControllers();
+
+// Configuração de Porta (Mantendo sua lógica original)
 var port = Environment.GetEnvironmentVariable("PORT") ?? "5000";
 builder.WebHost.UseUrls($"http://*:{port}");
 
 var app = builder.Build();
 
-// --- ENDPOINTS ---
+// --- 2. ENDPOINTS ---
 
-app.MapGet("/", () => "🚀 Smart Trader API: Online e Operante!");
+app.MapGet("/", () => "🚀 Smart Trader API: Online, Operante e com IA!");
+
+// [NOVO] Mapeia os Controllers (Faz o NewsController funcionar)
+app.MapControllers();
+
+
+// --- SEUS ENDPOINTS ANTIGOS (Minimal APIs) ---
+// Mantivemos eles intactos para garantir que o front/testes antigos não quebrem.
 
 // 1. Endpoint para listar ativos monitorados
 app.MapGet("/api/assets", async (IConfiguration config) =>
@@ -31,7 +50,6 @@ app.MapGet("/api/quotes/{ticker}", async (string ticker, IConfiguration config) 
     var connString = config.GetConnectionString("DefaultConnection");
     using var conn = new NpgsqlConnection(connString);
     
-    // Query otimizada juntando as tabelas
     var sql = @"
         SELECT 
             m.trade_date as Date,
@@ -44,7 +62,7 @@ app.MapGet("/api/quotes/{ticker}", async (string ticker, IConfiguration config) 
         JOIN assets a ON m.asset_id = a.id
         WHERE a.ticker = @Ticker
         ORDER BY m.trade_date DESC
-        LIMIT 30"; // Pega os últimos 30 pregões
+        LIMIT 30";
 
     var data = await conn.QueryAsync(sql, new { Ticker = ticker.ToUpper() });
     
