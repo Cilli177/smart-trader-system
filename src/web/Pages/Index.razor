@@ -1,0 +1,173 @@
+@page "/"
+@using Microsoft.AspNetCore.Components.Web
+@using web.Models
+@inject HttpClient Http
+
+<PageTitle>Smart Trader | Dashboard AI</PageTitle>
+
+<div class="container-fluid p-4">
+    <h2 class="mb-4">📈 Smart Trader AI Dashboard</h2>
+
+    @if (!string.IsNullOrEmpty(statusMessage))
+    {
+        <div class="alert @statusClass alert-dismissible fade show shadow-sm" role="alert">
+            <strong>Aviso:</strong> @statusMessage
+        </div>
+    }
+
+    <div class="mb-4">
+        <p class="text-muted small mb-2 fw-bold text-uppercase">⭐ Meus Favoritos</p>
+        <div class="d-flex flex-wrap gap-2">
+            @if (favorites == null)
+            {
+                <span class="spinner-border spinner-border-sm text-secondary"></span>
+            }
+            else
+            {
+                @foreach (var fav in favorites)
+                {
+                    <button class="btn btn-sm @(tickerSearch.Trim().ToUpper() == fav ? "btn-primary" : "btn-outline-primary") shadow-sm" 
+                            @onclick="() => SelectFavorite(fav)">
+                        @fav
+                    </button>
+                }
+            }
+        </div>
+    </div>
+
+    <div class="row mb-4">
+        <div class="col-md-8">
+            <div class="input-group shadow-sm">
+                <input type="text" @bind="tickerSearch" @bind:event="oninput" 
+                       @onkeyup="HandleKeyUp" class="form-control" placeholder="Ex: PETR4, VALE3..." />
+                
+                <button class="btn btn-dark" @onclick="LoadData">
+                    <span class="oi oi-magnifying-glass"></span> Analisar
+                </button>
+
+                @if (favorites != null && favorites.Contains(tickerSearch.Trim().ToUpper()))
+                {
+                    <button class="btn btn-danger ms-2 rounded d-flex align-items-center" @onclick="RemoveFavorite">
+                        <span class="oi oi-trash me-2"></span> <strong>Desfavoritar</strong>
+                    </button>
+                }
+                else
+                {
+                    <button class="btn btn-warning ms-2 rounded d-flex align-items-center" @onclick="SaveAsFavorite">
+                        <span class="oi oi-star me-2"></span> <strong>Favoritar</strong>
+                    </button>
+                }
+            </div>
+        </div>
+    </div>
+
+    <hr class="my-4" />
+
+    @if (isLoading)
+    {
+        <div class="text-center p-5">
+            <div class="spinner-border text-primary" role="status"></div>
+            <p class="mt-3 text-muted">Consultando IA para @tickerSearch...</p>
+        </div>
+    }
+    else if (newsList != null && newsList.Any())
+    {
+        <div class="row">
+            @foreach (var news in newsList)
+            {
+                <div class="col-md-6 mb-4">
+                    <div class="card h-100 shadow-sm border-0 border-start border-5 @(news.SentimentScore > 0 ? "border-success" : "border-danger")">
+                        <div class="card-body">
+                            <h6 class="fw-bold">@news.Title</h6>
+                            <p class="card-text text-muted small">@news.SentimentSummary</p>
+                            <div class="d-flex justify-content-between align-items-center mt-3">
+                                <span class="badge @(news.SentimentScore > 0 ? "bg-success" : "bg-danger") p-2">
+                                    Score: @news.SentimentScore.ToString("F2")
+                                </span>
+                                <a href="@news.Url" target="_blank" class="btn btn-sm btn-outline-secondary">Fonte</a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            }
+        </div>
+    }
+</div>
+
+@code {
+    private string tickerSearch = "PETR4";
+    private List<AssetNews>? newsList;
+    private List<string>? favorites;
+    private bool isLoading = false;
+    private string? statusMessage;
+    private string statusClass = "alert-success";
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadFavorites();
+        await LoadData();
+    }
+
+    private async Task LoadFavorites()
+    {
+        try {
+            var data = await Http.GetFromJsonAsync<List<FavoriteModel>>("api/favorites");
+            if (data != null) favorites = data.Select(f => f.Ticker.ToUpper()).ToList();
+        } catch { favorites = new List<string>(); }
+    }
+
+    private async Task LoadData()
+    {
+        if (string.IsNullOrWhiteSpace(tickerSearch)) return;
+        isLoading = true;
+        try {
+            newsList = await Http.GetFromJsonAsync<List<AssetNews>>($"api/news/{tickerSearch.Trim().ToUpper()}");
+        } catch { newsList = new List<AssetNews>(); }
+        finally { isLoading = false; }
+    }
+
+    private async Task SaveAsFavorite()
+    {
+        var ticker = tickerSearch.Trim().ToUpper();
+        if (string.IsNullOrWhiteSpace(ticker)) return;
+        
+        var response = await Http.PostAsync($"api/favorites/{ticker}", null);
+        if (response.IsSuccessStatusCode) {
+            await LoadFavorites();
+            ShowStatus($"Ativo {ticker} favoritado!", "alert-success");
+        }
+    }
+
+    private async Task RemoveFavorite()
+    {
+        var ticker = tickerSearch.Trim().ToUpper();
+        if (string.IsNullOrWhiteSpace(ticker)) return;
+
+        // O comando DELETE agora é enviado explicitamente para a API
+        var response = await Http.DeleteAsync($"api/favorites/{ticker}");
+        
+        if (response.IsSuccessStatusCode) {
+            await LoadFavorites(); // Recarrega a lista para o botão mudar na hora
+            ShowStatus($"Ativo {ticker} removido!", "alert-info");
+        } else {
+            ShowStatus("Erro ao remover dos favoritos.", "alert-danger");
+        }
+    }
+
+    private void ShowStatus(string msg, string css)
+    {
+        statusMessage = msg;
+        statusClass = css;
+        Task.Delay(3000).ContinueWith(_ => { statusMessage = null; InvokeAsync(StateHasChanged); });
+    }
+
+    private async Task SelectFavorite(string ticker)
+    {
+        tickerSearch = ticker;
+        await LoadData();
+    }
+
+    private async Task HandleKeyUp(KeyboardEventArgs e) { if (e.Key == "Enter") await LoadData(); }
+
+    public class FavoriteModel { public string Ticker { get; set; } = ""; }
+}

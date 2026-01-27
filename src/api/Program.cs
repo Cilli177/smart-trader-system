@@ -3,72 +3,72 @@ using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// --- 1. CONFIGURAÇÃO DE SERVIÇOS (Injeção de Dependência) ---
+// --- 1. CONFIGURAÇÃO DE SERVIÇOS ---
+var connectionString = "Host=shuttle.proxy.rlwy.net;Port=12070;Database=railway;Username=postgres;Password=bryYtZCTlvOwzAodgPAdjLQJbFTxGSzk";
 
-// Pega a string de conexão
-var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
-
-// [NOVO] Registra o NpgsqlDataSource. 
-// Isso é vital para o NewsController que criamos receber a conexão automaticamente.
-builder.Services.AddNpgsqlDataSource(connectionString!);
-
-// [NOVO] Habilita o uso de Controllers (arquivos separados na pasta Controllers)
+builder.Services.AddNpgsqlDataSource(connectionString);
 builder.Services.AddControllers();
 
-// Configuração de Porta (Mantendo sua lógica original)
+// CORS: Permitindo especificamente o método DELETE
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowAll", policy => 
+        policy.AllowAnyOrigin()
+              .AllowAnyMethod()
+              .AllowAnyHeader());
+});
+
 var port = Environment.GetEnvironmentVariable("PORT") ?? "5000";
 builder.WebHost.UseUrls($"http://*:{port}");
 
 var app = builder.Build();
 
-// --- 2. ENDPOINTS ---
+// --- 2. AUTO-MIGRATION ---
+using (var scope = app.Services.CreateScope())
+{
+    var dataSource = scope.ServiceProvider.GetRequiredService<NpgsqlDataSource>();
+    using var conn = await dataSource.OpenConnectionAsync();
+    await conn.ExecuteAsync(@"
+        CREATE TABLE IF NOT EXISTS user_favorites (
+            id SERIAL PRIMARY KEY,
+            ticker VARCHAR(10) NOT NULL UNIQUE,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );");
+}
 
-app.MapGet("/", () => "🚀 Smart Trader API: Online, Operante e com IA!");
-
-// [NOVO] Mapeia os Controllers (Faz o NewsController funcionar)
+// --- 3. PIPELINE E ENDPOINTS ---
+app.UseCors("AllowAll");
 app.MapControllers();
 
+app.MapGet("/", () => "🚀 Smart Trader API: Pronta para Favoritar e Remover!");
 
-// --- SEUS ENDPOINTS ANTIGOS (Minimal APIs) ---
-// Mantivemos eles intactos para garantir que o front/testes antigos não quebrem.
-
-// 1. Endpoint para listar ativos monitorados
-app.MapGet("/api/assets", async (IConfiguration config) =>
+// Listar favoritos
+app.MapGet("/api/favorites", async (NpgsqlDataSource dataSource) =>
 {
-    var connString = config.GetConnectionString("DefaultConnection");
-    using var conn = new NpgsqlConnection(connString);
-    
-    var sql = "SELECT id, ticker, name FROM assets WHERE is_active = true";
-    var assets = await conn.QueryAsync(sql);
-    
-    return Results.Ok(assets);
+    using var conn = await dataSource.OpenConnectionAsync();
+    return Results.Ok(await conn.QueryAsync("SELECT ticker FROM user_favorites ORDER BY ticker"));
 });
 
-// 2. Endpoint para ver o histórico de preços (OHLC)
-app.MapGet("/api/quotes/{ticker}", async (string ticker, IConfiguration config) =>
+// Salvar favorito
+app.MapPost("/api/favorites/{ticker}", async (string ticker, NpgsqlDataSource dataSource) =>
 {
-    var connString = config.GetConnectionString("DefaultConnection");
-    using var conn = new NpgsqlConnection(connString);
-    
-    var sql = @"
-        SELECT 
-            m.trade_date as Date,
-            m.close_price as Close,
-            m.volume as Volume,
-            m.open_price as Open,
-            m.high_price as High,
-            m.low_price as Low
-        FROM market_quotes m
-        JOIN assets a ON m.asset_id = a.id
-        WHERE a.ticker = @Ticker
-        ORDER BY m.trade_date DESC
-        LIMIT 30";
+    using var conn = await dataSource.OpenConnectionAsync();
+    var sql = "INSERT INTO user_favorites (ticker) VALUES (@Ticker) ON CONFLICT (ticker) DO NOTHING";
+    await conn.ExecuteAsync(sql, new { Ticker = ticker.Trim().ToUpper() });
+    return Results.Ok(new { status = "sucesso" });
+});
 
-    var data = await conn.QueryAsync(sql, new { Ticker = ticker.ToUpper() });
+// REMOVER favorito (Endpoint Corrigido)
+app.MapDelete("/api/favorites/{ticker}", async (string ticker, NpgsqlDataSource dataSource) =>
+{
+    using var conn = await dataSource.OpenConnectionAsync();
+    var sql = "DELETE FROM user_favorites WHERE ticker = @Ticker";
+    // O Trim() remove espaços invisíveis que podem causar falha na remoção
+    var rowsAffected = await conn.ExecuteAsync(sql, new { Ticker = ticker.Trim().ToUpper() });
     
-    if (!data.Any()) return Results.NotFound(new { msg = "Ativo não encontrado ou sem dados." });
-    
-    return Results.Ok(data);
+    return rowsAffected > 0 
+        ? Results.Ok(new { status = "removido" }) 
+        : Results.NotFound(new { status = "não encontrado" });
 });
 
 app.Run();
