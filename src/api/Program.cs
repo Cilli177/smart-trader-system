@@ -2,27 +2,26 @@ using Dapper;
 using Npgsql;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // --- 1. CONFIGURAÇÃO DE PORTA PARA PRODUÇÃO (RAILWAY) ---
-// A Railway injeta a porta na variável de ambiente 'PORT'
+// A Railway injeta a porta dinamicamente. Se falhar, usamos a 5000 como fallback.
 var port = Environment.GetEnvironmentVariable("PORT") ?? "5000";
 
 builder.WebHost.ConfigureKestrel(options =>
 {
-    // Escuta em qualquer IP (0.0.0.0) para permitir conexões externas
+    // CRÍTICO: ListenAnyIP permite que a Railway encaminhe tráfego para dentro do container.
     options.ListenAnyIP(int.Parse(port));
 });
 
-// --- 2. SERVIÇOS ---
+// --- 2. CONFIGURAÇÃO DE SERVIÇOS ---
 var connectionString = "Host=shuttle.proxy.rlwy.net;Port=12070;Database=railway;Username=postgres;Password=bryYtZCTlvOwzAodgPAdjLQJbFTxGSzk";
 
 builder.Services.AddNpgsqlDataSource(connectionString);
 builder.Services.AddControllers();
 
-// CORS: Essencial para que o seu Blazor (Web) consiga falar com esta API
+// CORS: Permite que o seu futuro serviço Blazor (Web) acesse esta API.
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowAll", policy => 
@@ -33,7 +32,7 @@ builder.Services.AddCors(options =>
 
 var app = builder.Build();
 
-// --- 3. AUTO-MIGRATION (Executa uma vez ao subir) ---
+// --- 3. AUTO-MIGRATION (Garante que o banco de dados está pronto) ---
 using (var scope = app.Services.CreateScope())
 {
     try 
@@ -49,7 +48,8 @@ using (var scope = app.Services.CreateScope())
     }
     catch (Exception ex) 
     {
-        Console.WriteLine($"Erro na migração: {ex.Message}");
+        // Log de erro no console para debug via Railway Deploy Logs
+        Console.WriteLine($"[ERRO MIGRATION]: {ex.Message}");
     }
 }
 
@@ -57,23 +57,24 @@ using (var scope = app.Services.CreateScope())
 app.UseCors("AllowAll");
 app.MapControllers();
 
-// Rota raiz para teste rápido de saúde da API
-app.MapGet("/", () => "🚀 Smart Trader API: Online e respondendo na porta " + port);
+// Endpoint de Saúde: Use este link para testar se a API estabilizou.
+app.MapGet("/", () => $"🚀 Smart Trader API Online na porta: {port}");
 
-// Listar favoritos
+// Listar ativos favoritos
 app.MapGet("/api/favorites", async (NpgsqlDataSource dataSource) =>
 {
     using var conn = await dataSource.OpenConnectionAsync();
-    return Results.Ok(await conn.QueryAsync("SELECT ticker FROM user_favorites ORDER BY ticker"));
+    var favs = await conn.QueryAsync("SELECT ticker FROM user_favorites ORDER BY ticker");
+    return Results.Ok(favs);
 });
 
-// Salvar favorito
+// Adicionar favorito
 app.MapPost("/api/favorites/{ticker}", async (string ticker, NpgsqlDataSource dataSource) =>
 {
     using var conn = await dataSource.OpenConnectionAsync();
     var sql = "INSERT INTO user_favorites (ticker) VALUES (@Ticker) ON CONFLICT (ticker) DO NOTHING";
     await conn.ExecuteAsync(sql, new { Ticker = ticker.Trim().ToUpper() });
-    return Results.Ok(new { status = "sucesso" });
+    return Results.Ok(new { msg = "Sucesso" });
 });
 
 // Remover favorito
@@ -81,8 +82,8 @@ app.MapDelete("/api/favorites/{ticker}", async (string ticker, NpgsqlDataSource 
 {
     using var conn = await dataSource.OpenConnectionAsync();
     var sql = "DELETE FROM user_favorites WHERE ticker = @Ticker";
-    var rows = await conn.ExecuteAsync(sql, new { Ticker = ticker.Trim().ToUpper() });
-    return rows > 0 ? Results.Ok(new { status = "removido" }) : Results.NotFound();
+    var affected = await conn.ExecuteAsync(sql, new { Ticker = ticker.Trim().ToUpper() });
+    return affected > 0 ? Results.Ok(new { msg = "Removido" }) : Results.NotFound();
 });
 
-app.Run(); // Este comando DEVE ser alcançado para a API ficar online
+app.Run();
