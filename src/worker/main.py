@@ -22,7 +22,7 @@ engine = create_engine(DB_URL)
 CACHED_MODEL_NAME = None
 
 def ensure_schema():
-    print("🔧 Schema check (V18)...")
+    print("🔧 Schema check (V19)...")
     with engine.begin() as conn:
         try:
             conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS price DECIMAL(18, 2) DEFAULT 0;"))
@@ -51,7 +51,7 @@ def get_valid_model():
     except: return "gemini-1.5-flash"
 
 def get_ai_analysis(ticker, info):
-    if not GEMINI_KEY: return ("Chave vazia", "Sem detalhes")
+    if not GEMINI_KEY: return ("Chave vazia", "Sem detalhes", 500)
 
     model_name = get_valid_model()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_KEY}"
@@ -86,7 +86,7 @@ def get_ai_analysis(ticker, info):
             except:
                 return ("Erro JSON", text_resp, 200)
         elif response.status_code == 429:
-            return ("⚠️ Cota Google Excedida", "Aguarde alguns minutos.", 429)
+            return ("⚠️ Cota Google Excedida", "Aguarde restabelecimento.", 429)
         else:
             return (f"Erro Google {response.status_code}", "", response.status_code)
             
@@ -95,17 +95,36 @@ def get_ai_analysis(ticker, info):
 
 def get_news_from_perplexity(ticker):
     if not PERPLEXITY_KEY: return "Sem chave News"
+    
     url = "https://api.perplexity.ai/chat/completions"
     payload = {
         "model": "sonar", 
-        "messages": [{"role": "user", "content": f"Manchete {ticker} hoje (max 20 palavras)."}]
+        "messages": [{"role": "user", "content": f"Manchete financeira de {ticker} hoje (max 20 palavras)."}]
     }
     headers = {"Authorization": f"Bearer {PERPLEXITY_KEY}", "Content-Type": "application/json"}
+    
     try:
         res = requests.post(url, json=payload, headers=headers).json()
-        if 'choices' in res: return res['choices'][0]['message']['content']
+        
+        if 'choices' in res:
+            content = res['choices'][0]['message']['content']
+            
+            # --- EXTRAÇÃO DE LINKS (CITAÇÕES) ---
+            citations = res.get('citations', [])
+            
+            if citations:
+                # Monta o rodapé com os links
+                formatted_text = content + "\n\nFontes:"
+                for i, link in enumerate(citations):
+                    # Formato: [1] http://url...
+                    formatted_text += f"\n[{i+1}] {link}"
+                return formatted_text
+            
+            return content
+            
         return "Sem dados."
-    except: return "Erro News"
+    except Exception as e:
+        return f"Erro News: {str(e)[:20]}"
 
 def fix_ticker(ticker):
     ticker = ticker.upper().strip()
@@ -113,7 +132,7 @@ def fix_ticker(ticker):
     return ticker
 
 def run_market_update():
-    print(f"\n--- 🚀 V18 (Blindado - Preço Primeiro): {datetime.now()} ---")
+    print(f"\n--- 🚀 V19 (Links Fontes + Blindado): {datetime.now()} ---")
     try:
         with engine.connect() as conn:
             assets = conn.execute(text("SELECT id, ticker, ai_analysis, last_update FROM assets")).fetchall()
@@ -121,7 +140,6 @@ def run_market_update():
         print(f"❌ Erro Banco: {e}")
         return
 
-    # Variável para controlar se o Google bloqueou a gente neste ciclo
     google_blocked = False
 
     for asset in assets:
@@ -129,7 +147,7 @@ def run_market_update():
         print(f"🔄 {real_ticker}...", end=" ")
         
         try:
-            # 1. PEGA DADOS DE MERCADO (Isso quase nunca falha)
+            # 1. MERCADO
             t = yf.Ticker(real_ticker)
             info = t.info
             current_price = info.get('currentPrice') or info.get('regularMarketPrice')
@@ -138,11 +156,11 @@ def run_market_update():
                 print("⚠️ Sem preço.")
                 continue
 
-            # 2. SALVA O PREÇO IMEDIATAMENTE (Garante que o BBAS3 saia do 0,00)
+            # 2. NOTÍCIAS (Agora com Links!)
             news = get_news_from_perplexity(real_ticker)
             
+            # Salva preço e news imediatamente
             with engine.begin() as conn:
-                # Atualiza preço e notícias, mantém IA antiga por enquanto
                 conn.execute(text("""
                     UPDATE assets SET 
                     price = :pr, pe_ratio = :pe, dy_percentage = :dy, news_summary = :news, last_update = CURRENT_TIMESTAMP
@@ -155,41 +173,38 @@ def run_market_update():
                     "aid": asset.id
                 })
             
-            print(f"💰 Preço salvo (R${current_price}).", end=" ")
+            print(f"💰 Dados salvos.", end=" ")
 
-            # 3. VERIFICA SE PRECISA/PODE RODAR IA
-            # Se o Google já deu 429 neste ciclo, nem tenta os próximos para não piorar o bloqueio
+            # 3. IA (Com trava de segurança)
             if google_blocked:
-                print("⏭️ Google bloqueado, pulando IA.")
+                print("⏭️ 429 Ativo. Skip IA.")
                 continue
 
-            # Lógica de Skip (Se atualizou há menos de 4h e não tem erro, pula)
+            # Skip se recente
             last_up = asset.last_update
             current_ai = asset.ai_analysis or ""
             is_recent = last_up and (datetime.now() - last_up).total_seconds() < 14400
             has_valid_ai = "Erro" not in current_ai and "Cota" not in current_ai and len(current_ai) > 10
 
             if is_recent and has_valid_ai:
-                print("✅ IA recente. Pulando.")
+                print("✅ IA recente. Skip.")
                 continue
 
-            # 4. TENTA RODAR IA
+            # Tenta IA
             summary, full_report, status_code = get_ai_analysis(real_ticker, info)
             
             if status_code == 429:
-                print("🛑 429 Detectado! Parando IAs por este ciclo.")
-                google_blocked = True # Ativa a trava de segurança
-                # Salva o aviso de cota excedida
+                print("🛑 429! Parando IAs.")
+                google_blocked = True
                 with engine.begin() as conn:
                     conn.execute(text("UPDATE assets SET ai_analysis = :ana WHERE id = :aid"), 
-                                {"ana": "⚠️ Cota Excedida (Tentando mais tarde)", "aid": asset.id})
+                                {"ana": "⚠️ Cota Excedida", "aid": asset.id})
             else:
-                # Salva IA com sucesso
                 with engine.begin() as conn:
                     conn.execute(text("UPDATE assets SET ai_analysis = :ana, full_report = :full WHERE id = :aid"), 
                                 {"ana": summary, "full": full_report, "aid": asset.id})
-                print("✅ IA Atualizada.")
-                time.sleep(15) # Pausa segura
+                print("✅ IA OK.")
+                time.sleep(15) 
 
         except Exception as e:
             print(f"❌ Erro: {e}")
