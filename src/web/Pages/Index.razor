@@ -141,24 +141,22 @@
     private void OpenModal(AssetDto asset) => selectedAsset = asset;
     private void CloseModal() => selectedAsset = null;
 
-    // --- FORMATAÇÃO VISUAL (LINKS E MARKDOWN) ---
-
+    // --- FORMATAÇÃO HORIZONTAL DE LINKS ---
     private string FormatNews(string text)
     {
         if (string.IsNullOrEmpty(text)) return "Sem notícias.";
         
-        // 1. Quebra linhas
-        var html = text.Replace("\n", "<br/>");
-
-        // 2. Transforma [N] http://url em apenas [N] clicável
-        // Grupo 1 = [N]
-        // Grupo 2 = URL
-        string pattern = @"(\[\d+\])\s*(https?://[^\s<]+)";
+        // 1. Regex para encontrar citações precedidas de quebra de linha
+        // Padrão: \n + [N] + espaço + URL
+        // Ação: Remove o \n e coloca um espaço (&nbsp;) para ficarem lado a lado
+        string citationPattern = @"\n+(\[\d+\])\s*(https?://[^\s]+)";
         
-        html = Regex.Replace(html, pattern, m => 
-            // Link envolve o número, com cor primária (azul) e negrito
-            $"<a href=\"{m.Groups[2].Value}\" target=\"_blank\" class=\"text-primary fw-bold text-decoration-none px-1\" title=\"Abrir Fonte\">{m.Groups[1].Value}</a>"
+        string html = Regex.Replace(text, citationPattern, m => 
+            $"&nbsp;<a href=\"{m.Groups[2].Value}\" target=\"_blank\" class=\"text-primary fw-bold text-decoration-none\" title=\"Abrir Fonte\">{m.Groups[1].Value}</a>"
         );
+
+        // 2. Só depois substitui as quebras de linha restantes (do texto) por <br/>
+        html = html.Replace("\n", "<br/>");
 
         return html;
     }
@@ -166,7 +164,6 @@
     private string FormatFullReport(string text)
     {
         if (string.IsNullOrEmpty(text)) return "Carregando detalhes...";
-        // Suporte a Negrito (**texto**)
         var html = Regex.Replace(text, @"\*\*(.*?)\*\*", "<b>$1</b>");
         return html;
     }
