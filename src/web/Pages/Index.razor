@@ -34,7 +34,7 @@
                         <th>Ativo</th>
                         <th>Preço</th>
                         <th>P/L</th>
-                        <th>Resumo IA (50w)</th>
+                        <th>Resumo IA (Sentimento)</th>
                         <th>Notícias & Fontes</th>
                         <th>Ações</th>
                     </tr>
@@ -48,17 +48,17 @@
                             <td>@(item.PeRatio.ToString("N2"))</td>
                             
                             <td class="small" style="max-width: 300px;">
-                                @if (item.AiAnalysis.Contains("429"))
+                                @if (item.AiAnalysis.Contains("429") || item.AiAnalysis.Contains("Erro") || item.AiAnalysis.Contains("Cota"))
                                 {
-                                    <span class="text-warning fw-bold">⚠️ @item.AiAnalysis</span>
-                                }
-                                else if (item.AiAnalysis.Contains("Erro"))
-                                {
-                                    <span class="text-danger">@item.AiAnalysis</span>
+                                    // Mantém mensagens de erro em amarelo/vermelho puro
+                                    <span class="@(item.AiAnalysis.Contains("429") || item.AiAnalysis.Contains("Cota") ? "text-warning" : "text-danger") fw-bold">
+                                        @item.AiAnalysis
+                                    </span>
                                 }
                                 else
                                 {
-                                    @item.AiAnalysis
+                                    // Aplica coloração de sentimento no texto normal
+                                    @((MarkupString)FormatSentiment(item.AiAnalysis))
                                 }
                                 <br/>
                                 <button class="btn btn-link btn-sm p-0 mt-1 text-decoration-none fw-bold" 
@@ -141,26 +141,43 @@
     private void OpenModal(AssetDto asset) => selectedAsset = asset;
     private void CloseModal() => selectedAsset = null;
 
-    // --- FORMATAÇÃO HORIZONTAL DE LINKS ---
+    // --- FORMATAÇÃO VISUAL ---
+
+    // 1. Coloração de Sentimento (NOVO!)
+    private string FormatSentiment(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return text;
+
+        // RegexOptions.IgnoreCase faz com que "Compra" e "compra" sejam detectados
+
+        // Verde (Positivo)
+        string greenKeywords = @"\b(compra|oportunidade|positivo|atrativo|upside|barato|sólido|forte|excelente)\b";
+        text = Regex.Replace(text, greenKeywords, "<span class='text-success fw-bold'>$1</span>", RegexOptions.IgnoreCase);
+
+        // Amarelo (Cautela/Neutro)
+        string yellowKeywords = @"\b(cautela|risco|neutro|atenção|desafiador|volatilidade|monitorar|elevado)\b";
+        text = Regex.Replace(text, yellowKeywords, "<span class='text-warning fw-bold' style='color: #fd7e14 !important;'>$1</span>", RegexOptions.IgnoreCase); // Usei laranja para destacar mais
+
+        // Vermelho (Negativo)
+        string redKeywords = @"\b(venda|negativo|caro|queda|prejuízo|fraco|ruim)\b";
+        text = Regex.Replace(text, redKeywords, "<span class='text-danger fw-bold'>$1</span>", RegexOptions.IgnoreCase);
+
+        return text;
+    }
+
+    // 2. Links Horizontais
     private string FormatNews(string text)
     {
         if (string.IsNullOrEmpty(text)) return "Sem notícias.";
-        
-        // 1. Regex para encontrar citações precedidas de quebra de linha
-        // Padrão: \n + [N] + espaço + URL
-        // Ação: Remove o \n e coloca um espaço (&nbsp;) para ficarem lado a lado
         string citationPattern = @"\n+(\[\d+\])\s*(https?://[^\s]+)";
-        
         string html = Regex.Replace(text, citationPattern, m => 
             $"&nbsp;<a href=\"{m.Groups[2].Value}\" target=\"_blank\" class=\"text-primary fw-bold text-decoration-none\" title=\"Abrir Fonte\">{m.Groups[1].Value}</a>"
         );
-
-        // 2. Só depois substitui as quebras de linha restantes (do texto) por <br/>
         html = html.Replace("\n", "<br/>");
-
         return html;
     }
 
+    // 3. Markdown Básico para o Modal
     private string FormatFullReport(string text)
     {
         if (string.IsNullOrEmpty(text)) return "Carregando detalhes...";
