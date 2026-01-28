@@ -19,8 +19,8 @@ if not DB_URL:
 
 engine = create_engine(DB_URL)
 
-# Variável Global para Cache do Modelo
-FOUND_MODEL = None
+# Cache para não ficar perguntando toda hora
+CACHED_MODEL_NAME = None
 
 def ensure_schema():
     print("🔧 Schema check...")
@@ -35,76 +35,67 @@ def ensure_schema():
         except Exception as e:
             print(f"⚠️ Aviso schema: {e}")
 
-def find_working_model():
-    """DIAGNÓSTICO: Pergunta ao Google quais modelos a chave pode usar"""
-    global FOUND_MODEL
-    if FOUND_MODEL: return FOUND_MODEL
+def get_valid_model():
+    """Pergunta ao Google qual modelo está disponível para esta chave"""
+    global CACHED_MODEL_NAME
+    if CACHED_MODEL_NAME: return CACHED_MODEL_NAME
 
-    # Tenta listar modelos na versão v1beta (mais abrangente)
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_KEY}"
-    
     try:
         response = requests.get(url, timeout=10)
         data = response.json()
         
-        if 'error' in data:
-            return f"ERRO API: {data['error']['message']}"
-            
         if 'models' not in data:
-            return "LISTA VAZIA (Sua chave não vê modelos)"
+            return None # Chave inválida ou erro
 
-        # Procura o primeiro modelo que gera texto
-        available_models = []
+        # Procura o primeiro modelo 'gemini' que gera texto
         for m in data['models']:
             name = m['name'].replace("models/", "")
-            available_models.append(name)
-            if 'generateContent' in m.get('supportedGenerationMethods', []):
-                print(f"✅ Modelo Válido Encontrado: {name}")
-                FOUND_MODEL = name # Salva para não buscar de novo
+            if "gemini" in name and "generateContent" in m.get('supportedGenerationMethods', []):
+                print(f"✅ Modelo Detectado: {name}")
+                CACHED_MODEL_NAME = name
                 return name
         
-        return f"SEM MODELOS TEXTO. Disponíveis: {', '.join(available_models[:3])}"
-
-    except Exception as e:
-        return f"ERRO CONEXÃO: {str(e)}"
+        # Se não achar nada, tenta o flash padrão
+        return "gemini-1.5-flash"
+    except:
+        return "gemini-1.5-flash"
 
 def get_ai_analysis(ticker, info):
     if not GEMINI_KEY: return "Chave Gemini vazia."
 
-    # 1. Descobre qual modelo usar (ou o erro)
-    model_name_or_error = find_working_model()
-    
-    # Se o retorno parecer um erro (tem espaços ou é longo), exibe na tela
-    if " " in model_name_or_error and "gemini" not in model_name_or_error:
-        return f"DIAGNÓSTICO: {model_name_or_error}"
+    # 1. Pega o modelo correto
+    model_name = get_valid_model()
+    if not model_name: return "ERRO: Chave não acessa modelos."
 
-    # 2. Usa o modelo descoberto
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name_or_error}:generateContent?key={GEMINI_KEY}"
+    # 2. Monta a URL
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_KEY}"
     
-    # Prompt V10 (Deep Analysis)
+    # 3. Prompt Rico (Igual ao da Petrobras que funcionou)
+    pl = info.get('trailingPE', 'N/A')
+    roe = info.get('returnOnEquity', 0)
+    roe_fmt = f"{roe*100:.1f}%" if isinstance(roe, (int, float)) else "N/A"
+    
     prompt = f"""
-    Analista B3 Sênior. Ativo: {ticker}.
-    Preço: R$ {info.get('currentPrice')}. P/L: {info.get('trailingPE', 'N/A')}.
-    ROE: {info.get('returnOnEquity', 0)}.
-    
-    Em 1 parágrafo técnico (max 35 palavras):
-    O valuation (P/L) e a qualidade (ROE) indicam compra ou cautela?
+    Analista Sênior B3. Ativo: {ticker}.
+    Preço: R$ {info.get('currentPrice')}. P/L: {pl}. ROE: {roe_fmt}.
+    Em 1 parágrafo denso (PT-BR): Interprete os indicadores (P/L e ROE). Indica oportunidade ou risco?
     """
     
     headers = {'Content-Type': 'application/json'}
     data = {"contents": [{"parts": [{"text": prompt}]}]}
     
     try:
-        response = requests.post(url, headers=headers, json=data, timeout=15)
+        response = requests.post(url, headers=headers, json=data, timeout=30)
         if response.status_code == 200:
             return response.json()['candidates'][0]['content']['parts'][0]['text']
         else:
-            return f"Erro {response.status_code} no modelo {model_name_or_error}"
+            return f"Erro Google ({response.status_code})"
     except Exception as e:
         return f"Erro Req: {str(e)[:20]}"
 
 def get_news_from_perplexity(ticker):
-    # Notícias estão funcionando, mantemos.
+    # Perplexity está ótimo, não mexe.
     if not PERPLEXITY_KEY: return "Chave News vazia."
     url = "https://api.perplexity.ai/chat/completions"
     payload = {
@@ -125,7 +116,7 @@ def fix_ticker(ticker):
     return ticker
 
 def run_market_update():
-    print(f"\n--- 🚀 Inteligência V12 (Diagnóstico): {datetime.now()} ---")
+    print(f"\n--- 🚀 V13 (Auto-Modelo + Paciência): {datetime.now()} ---")
     
     try:
         with engine.connect() as conn:
@@ -147,9 +138,13 @@ def run_market_update():
                 print("⚠️ Sem preço.")
                 continue
 
+            # IA
             analysis = get_ai_analysis(real_ticker, info)
+            
+            # Notícias
             news = get_news_from_perplexity(real_ticker)
             
+            # Salva no Banco
             with engine.begin() as conn:
                 sql = text("""
                     UPDATE assets SET 
@@ -165,7 +160,11 @@ def run_market_update():
                     "news": news,
                     "aid": asset.id
                 })
-            print(f"✅ R$ {current_price} | Resposta: {analysis[:20]}...")
+            print(f"✅ Salvo. Aguardando 5s...")
+            
+            # --- O SEGREDO DO SUCESSO ---
+            # Pausa de 5 segundos para o Google não bloquear a gente
+            time.sleep(5) 
             
         except Exception as e:
             print(f"❌ Erro: {e}")
