@@ -67,7 +67,7 @@
                                 </button>
                             </td>
 
-                            <td class="small text-muted" style="max-width: 300px; font-size: 0.85rem;">
+                            <td class="small text-muted" style="max-width: 300px; font-size: 0.9rem;">
                                 @((MarkupString)FormatNews(item.NewsSummary))
                             </td>
 
@@ -141,29 +141,32 @@
     private void OpenModal(AssetDto asset) => selectedAsset = asset;
     private void CloseModal() => selectedAsset = null;
 
-    // --- MAGIA DOS LINKS CLICÁVEIS ---
+    // --- FORMATAÇÃO VISUAL (LINKS E MARKDOWN) ---
+
     private string FormatNews(string text)
     {
         if (string.IsNullOrEmpty(text)) return "Sem notícias.";
         
-        // 1. Quebra linhas para ficar bonito
+        // 1. Quebra linhas
         var html = text.Replace("\n", "<br/>");
 
-        // 2. Regex para encontrar URLs e transformar em Links
-        // Padrão: [N] http://...
+        // 2. Transforma [N] http://url em apenas [N] clicável
+        // Grupo 1 = [N]
+        // Grupo 2 = URL
         string pattern = @"(\[\d+\])\s*(https?://[^\s<]+)";
+        
         html = Regex.Replace(html, pattern, m => 
-            $"{m.Groups[1].Value} <a href=\"{m.Groups[2].Value}\" target=\"_blank\" class=\"text-primary text-decoration-underline\">Ver Fonte 🔗</a>"
+            // Link envolve o número, com cor primária (azul) e negrito
+            $"<a href=\"{m.Groups[2].Value}\" target=\"_blank\" class=\"text-primary fw-bold text-decoration-none px-1\" title=\"Abrir Fonte\">{m.Groups[1].Value}</a>"
         );
 
         return html;
     }
 
-    // Formata o relatório para negrito funcionar se a IA mandar markdown
     private string FormatFullReport(string text)
     {
         if (string.IsNullOrEmpty(text)) return "Carregando detalhes...";
-        // Transforma **Texto** em <b>Texto</b>
+        // Suporte a Negrito (**texto**)
         var html = Regex.Replace(text, @"\*\*(.*?)\*\*", "<b>$1</b>");
         return html;
     }
