@@ -9,8 +9,7 @@ var builder = WebApplication.CreateBuilder(args);
 var port = Environment.GetEnvironmentVariable("PORT") ?? "5000";
 builder.WebHost.ConfigureKestrel(options => options.ListenAnyIP(int.Parse(port)));
 
-// --- 2. BANCO DE DADOS (IMPORTANTE) ---
-// Tenta pegar a variável da Railway primeiro. Se não tiver, usa a sua string fixa de backup.
+// --- 2. BANCO DE DADOS ---
 var dbUrl = Environment.GetEnvironmentVariable("DATABASE_URL");
 var connectionString = string.IsNullOrEmpty(dbUrl) 
     ? "Host=shuttle.proxy.rlwy.net;Port=12070;Database=railway;Username=postgres;Password=bryYtZCTlvOwzAodgPAdjLQJbFTxGSzk"
@@ -18,97 +17,65 @@ var connectionString = string.IsNullOrEmpty(dbUrl)
 
 builder.Services.AddNpgsqlDataSource(connectionString);
 builder.Services.AddControllers();
-
-// CORS Liberado
-builder.Services.AddCors(options =>
-{
-    options.AddPolicy("AllowAll", policy => 
-        policy.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader());
-});
+builder.Services.AddCors(options => { options.AddPolicy("AllowAll", policy => policy.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader()); });
 
 var app = builder.Build();
-
 app.UseCors("AllowAll");
 app.MapControllers();
 
-// --- 3. ENDPOINTS ---
+app.MapGet("/", () => "API Online 🚀");
 
-app.MapGet("/", () => "API Smart Trader Online 🚀");
-
-// *** NOVO: Endpoint de Emergência para Criar Tabelas ***
-// Se der erro 500, acesse: /api/reset no navegador
-app.MapGet("/api/reset", async (NpgsqlDataSource dataSource) =>
+// --- ENDPOINT BLINDADO (Com tratamento de erro explícito) ---
+app.MapGet("/api/favorites", async (NpgsqlDataSource dataSource) =>
 {
-    try 
+    try
     {
         using var conn = await dataSource.OpenConnectionAsync();
         
-        await conn.ExecuteAsync(@"
-            CREATE TABLE IF NOT EXISTS user_favorites (
-                id SERIAL PRIMARY KEY,
-                ticker VARCHAR(10) NOT NULL UNIQUE,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            
-            CREATE TABLE IF NOT EXISTS sectors (
-                id SERIAL PRIMARY KEY,
-                name VARCHAR(100) NOT NULL UNIQUE
-            );
-            
-            CREATE TABLE IF NOT EXISTS assets (
-                id SERIAL PRIMARY KEY,
-                ticker VARCHAR(20) NOT NULL UNIQUE,
-                name VARCHAR(100),
-                sector_id INTEGER,
-                price DECIMAL(18, 2) DEFAULT 0,
-                pe_ratio DECIMAL(10, 2) DEFAULT 0,
-                dy_percentage DECIMAL(10, 2) DEFAULT 0,
-                ai_analysis TEXT,
-                news_summary TEXT,
-                news_links JSONB,
-                sentiment VARCHAR(20) DEFAULT 'Neutro',
-                last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        ");
-
-        // Insere dados de teste
-        await conn.ExecuteAsync("INSERT INTO sectors (name) VALUES ('Geral') ON CONFLICT DO NOTHING;");
-        await conn.ExecuteAsync("INSERT INTO assets (ticker, name) VALUES ('PETR4.SA', 'Petrobras'), ('VALE3.SA', 'Vale') ON CONFLICT (ticker) DO NOTHING;");
+        // O segredo está nos COALESCE: Transformam NULL em 0 ou texto padrão
+        var sql = @"
+            SELECT 
+                f.ticker, 
+                COALESCE(a.price, 0) as Price, 
+                COALESCE(a.pe_ratio, 0) as PeRatio, 
+                COALESCE(a.dy_percentage, 0) as DyPercentage, 
+                COALESCE(a.ai_analysis, 'Aguardando atualização do Worker...') as AiAnalysis, 
+                COALESCE(a.news_summary, 'Sem notícias no momento') as NewsSummary
+            FROM user_favorites f
+            LEFT JOIN assets a ON f.ticker = a.ticker
+            ORDER BY f.ticker";
         
-        return Results.Ok("SUCESSO: Tabelas Recriadas e Dados Inseridos! Volte para o Dashboard.");
+        var result = await conn.QueryAsync(sql);
+        return Results.Ok(result);
     }
     catch (Exception ex)
     {
-        return Results.Problem($"ERRO CRÍTICO NO BANCO: {ex.Message}");
+        // Se der erro, ele vai aparecer na tela em vez de apenas '500'
+        Console.WriteLine($"[ERRO GRAVE]: {ex.Message}");
+        return Results.Problem($"Erro no servidor: {ex.Message}");
     }
 });
 
-// Endpoint Principal (Dashboard)
-app.MapGet("/api/favorites", async (NpgsqlDataSource dataSource) =>
+// Endpoint de Reset (Mantido caso precise usar de novo)
+app.MapGet("/api/reset", async (NpgsqlDataSource dataSource) =>
 {
     using var conn = await dataSource.OpenConnectionAsync();
-    var sql = @"
-        SELECT 
-            f.ticker, 
-            COALESCE(a.price, 0) as Price, 
-            a.pe_ratio as PeRatio, 
-            a.dy_percentage as DyPercentage, 
-            COALESCE(a.ai_analysis, 'Aguardando Worker...') as AiAnalysis, 
-            a.news_summary as NewsSummary
-        FROM user_favorites f
-        LEFT JOIN assets a ON f.ticker = a.ticker
-        ORDER BY f.ticker";
-    
-    return Results.Ok(await conn.QueryAsync(sql));
+    // (Código de criação de tabelas mantido igual ao anterior...)
+    await conn.ExecuteAsync("CREATE TABLE IF NOT EXISTS user_favorites (id SERIAL PRIMARY KEY, ticker VARCHAR(10) UNIQUE, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);");
+    await conn.ExecuteAsync("CREATE TABLE IF NOT EXISTS sectors (id SERIAL PRIMARY KEY, name VARCHAR(100) UNIQUE);");
+    await conn.ExecuteAsync("CREATE TABLE IF NOT EXISTS assets (id SERIAL PRIMARY KEY, ticker VARCHAR(20) UNIQUE, name VARCHAR(100), sector_id INTEGER, price DECIMAL(18,2), pe_ratio DECIMAL(10,2), dy_percentage DECIMAL(10,2), ai_analysis TEXT, news_summary TEXT, news_links JSONB, sentiment VARCHAR(20), last_update TIMESTAMP);");
+    await conn.ExecuteAsync("INSERT INTO sectors (name) VALUES ('Geral') ON CONFLICT DO NOTHING;");
+    await conn.ExecuteAsync("INSERT INTO assets (ticker, name) VALUES ('PETR4.SA', 'Petrobras'), ('VALE3.SA', 'Vale') ON CONFLICT (ticker) DO NOTHING;");
+    return Results.Ok("SUCESSO: Banco Resetado.");
 });
 
 // Adicionar Favorito
 app.MapPost("/api/favorites/{ticker}", async (string ticker, NpgsqlDataSource dataSource) =>
 {
     using var conn = await dataSource.OpenConnectionAsync();
-    var cleanTicker = ticker.Trim().ToUpper();
-    await conn.ExecuteAsync("INSERT INTO user_favorites (ticker) VALUES (@T) ON CONFLICT (ticker) DO NOTHING", new { T = cleanTicker });
-    await conn.ExecuteAsync("INSERT INTO assets (ticker, name) VALUES (@T, 'Novo') ON CONFLICT (ticker) DO NOTHING", new { T = cleanTicker });
+    var t = ticker.Trim().ToUpper();
+    await conn.ExecuteAsync("INSERT INTO user_favorites (ticker) VALUES (@T) ON CONFLICT (ticker) DO NOTHING", new { T = t });
+    await conn.ExecuteAsync("INSERT INTO assets (ticker, name) VALUES (@T, 'Novo') ON CONFLICT (ticker) DO NOTHING", new { T = t });
     return Results.Ok();
 });
 

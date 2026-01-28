@@ -6,32 +6,38 @@
 <div class="container p-4">
     <div class="d-flex justify-content-between align-items-center mb-4">
         <h3>🚀 Smart Trader AI</h3>
-        <span class="badge bg-success">Sistema Online</span>
+        <span class="badge bg-success">Online</span>
     </div>
 
+    @if (!string.IsNullOrEmpty(errorMessage))
+    {
+        <div class="alert alert-danger">
+            <strong>Erro ao carregar dados:</strong> @errorMessage
+        </div>
+    }
+
     <div class="input-group mb-4 shadow-sm">
-        <input type="text" @bind="tickerInput" class="form-control" placeholder="Digite o ativo (ex: WEGE3)..." @onkeyup="HandleKey" />
+        <input type="text" @bind="tickerInput" class="form-control" placeholder="Ex: WEGE3" @onkeyup="HandleKey" />
         <button class="btn btn-primary" @onclick="AddFavorite">Monitorar</button>
     </div>
 
-    @if (assets == null)
+    @if (isLoading)
     {
-        <div class="text-center"><div class="spinner-border text-primary"></div><p>Carregando carteira...</p></div>
+        <div class="text-center py-5">
+            <div class="spinner-border text-primary"></div>
+            <p class="mt-2">Carregando carteira...</p>
+        </div>
     }
-    else if (!assets.Any())
+    else if (assets != null && assets.Any())
     {
-        <div class="alert alert-info">Nenhum ativo monitorado. Adicione um acima!</div>
-    }
-    else
-    {
-        <div class="card shadow-sm">
-            <table class="table table-hover mb-0">
+        <div class="card shadow-sm border-0">
+            <table class="table table-hover mb-0 align-middle">
                 <thead class="table-dark">
                     <tr>
                         <th>Ativo</th>
                         <th>Preço</th>
                         <th>P/L</th>
-                        <th>Análise IA (Gemini)</th>
+                        <th>Análise IA</th>
                         <th>Notícias</th>
                         <th>Ação</th>
                     </tr>
@@ -41,12 +47,12 @@
                     {
                         <tr>
                             <td class="fw-bold">@item.Ticker</td>
-                            <td>R$ @item.Price.ToString("N2")</td>
-                            <td>@item.PeRatio.ToString("N2")</td>
-                            <td class="small">@item.AiAnalysis</td>
-                            <td class="small text-muted">@item.NewsSummary</td>
+                            <td>R$ @(item.Price?.ToString("N2") ?? "0.00")</td>
+                            <td>@(item.PeRatio?.ToString("N2") ?? "-")</td>
+                            <td class="small" style="max-width: 300px;">@item.AiAnalysis</td>
+                            <td class="small text-muted" style="max-width: 250px;">@item.NewsSummary</td>
                             <td>
-                                <button class="btn btn-sm btn-outline-danger" @onclick="() => Remove(item.Ticker)">🗑️</button>
+                                <button class="btn btn-sm btn-outline-danger" @onclick="() => Remove(item.Ticker)">X</button>
                             </td>
                         </tr>
                     }
@@ -54,11 +60,19 @@
             </table>
         </div>
     }
+    else
+    {
+        <div class="alert alert-info text-center">
+            Sua lista está vazia. Adicione um ativo acima!
+        </div>
+    }
 </div>
 
 @code {
     private string tickerInput = "";
     private List<AssetDto>? assets;
+    private bool isLoading = true;
+    private string? errorMessage;
 
     protected override async Task OnInitializedAsync()
     {
@@ -67,14 +81,20 @@
 
     private async Task LoadData()
     {
+        isLoading = true;
+        errorMessage = null;
         try 
         {
-            // Busca apenas do endpoint seguro /api/favorites
             assets = await Http.GetFromJsonAsync<List<AssetDto>>("api/favorites");
         }
         catch (Exception ex) 
         {
-            Console.WriteLine($"Erro: {ex.Message}");
+            errorMessage = ex.Message; // Mostra o erro na tela se falhar
+            Console.WriteLine(ex);
+        }
+        finally
+        {
+            isLoading = false;
         }
     }
 
@@ -97,10 +117,10 @@
     public class AssetDto
     {
         public string Ticker { get; set; } = "";
-        public decimal Price { get; set; }
-        public decimal PeRatio { get; set; }
-        public decimal DyPercentage { get; set; }
-        public string AiAnalysis { get; set; } = "";
-        public string NewsSummary { get; set; } = "";
+        public decimal? Price { get; set; }      // Aceita NULL
+        public decimal? PeRatio { get; set; }    // Aceita NULL
+        public decimal? DyPercentage { get; set; }// Aceita NULL
+        public string? AiAnalysis { get; set; }
+        public string? NewsSummary { get; set; }
     }
 }
