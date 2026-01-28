@@ -3,8 +3,7 @@ import time
 import schedule
 import yfinance as yf
 import requests
-from google import genai
-from google.genai import types
+import json
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 from datetime import datetime
@@ -36,37 +35,42 @@ def ensure_schema():
             print(f"⚠️ Aviso schema: {e}")
 
 def get_ai_analysis(ticker, info):
-    """Gera análise via Gemini com FALLBACK de modelos"""
+    """Gera análise via REST API Direta (Sem SDK)"""
     if not GEMINI_KEY: return "Chave Gemini ausente."
     
-    # Lista de modelos para tentar (do mais novo para o mais estável)
-    # Isso evita o erro 404 se um modelo específico mudar de nome
-    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-flash-001', 'gemini-1.5-flash-latest']
-    
-    client = genai.Client(api_key=GEMINI_KEY)
+    # URL Direta da API (Funciona sempre)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
     
     prompt = f"""
-    Aja como um investidor experiente na B3.
+    Aja como um analista senior de ações da B3.
     Ativo: {ticker}
+    Preço: R$ {info.get('currentPrice', 0)}
     P/L: {info.get('trailingPE', 'N/A')}
     Dividend Yield: {info.get('dividendYield', 0)*100 if info.get('dividendYield') else 0:.2f}%
     
-    Em UMA frase curta e direta (max 20 palavras): O indicador P/L sugere que está cara ou barata? Vale o risco?
+    Responda em 1 frase curta (max 25 palavras): O valuation está atrativo? Qual o principal risco ou oportunidade?
     """
-
-    for model_name in models_to_try:
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt
-            )
-            return response.text
-        except Exception as e:
-            # Se der erro 404, ele apenas tenta o próximo modelo da lista
-            continue
+    
+    headers = {'Content-Type': 'application/json'}
+    data = {
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }]
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=data)
+        
+        if response.status_code == 200:
+            # Parse do JSON de resposta do Google
+            return response.json()['candidates'][0]['content']['parts'][0]['text']
+        else:
+            print(f"⚠️ Erro Google API ({response.status_code}): {response.text}")
+            return f"Erro na IA: {response.status_code}"
             
-    print(f"⚠️ Todos os modelos Gemini falharam para {ticker}")
-    return "Análise indisponível no momento."
+    except Exception as e:
+        print(f"⚠️ Erro Request Gemini: {e}")
+        return "Análise indisponível."
 
 def get_news_from_perplexity(ticker):
     """Busca notícias via Perplexity"""
@@ -75,7 +79,7 @@ def get_news_from_perplexity(ticker):
     url = "https://api.perplexity.ai/chat/completions"
     payload = {
         "model": "llama-3.1-sonar-small-128k-online",
-        "messages": [{"role": "user", "content": f"Resuma em 1 frase a notícia mais importante de hoje sobre {ticker}. Se não houver, fale sobre o setor."}]
+        "messages": [{"role": "user", "content": f"Qual a manchete financeira mais importante sobre {ticker} hoje? Resuma em 10 palavras."}]
     }
     headers = {"Authorization": f"Bearer {PERPLEXITY_KEY}", "Content-Type": "application/json"}
     
@@ -83,7 +87,7 @@ def get_news_from_perplexity(ticker):
         res = requests.post(url, json=payload, headers=headers).json()
         if 'choices' in res:
             return res['choices'][0]['message']['content']
-        return "Sem notícias recentes."
+        return "Sem notícias relevantes."
     except Exception as e:
         print(f"⚠️ Erro Perplexity ({ticker}): {e}")
         return "Erro nas notícias."
@@ -95,7 +99,7 @@ def fix_ticker(ticker):
     return ticker
 
 def run_market_update():
-    print(f"\n--- 🚀 Inteligência V4 (Multi-Model): {datetime.now()} ---")
+    print(f"\n--- 🚀 Inteligência V5 (Direct REST): {datetime.now()} ---")
     
     try:
         with engine.connect() as conn:
@@ -114,7 +118,7 @@ def run_market_update():
             current_price = info.get('currentPrice') or info.get('regularMarketPrice')
             
             if not current_price:
-                print("⚠️ Sem preço.")
+                print("⚠️ Sem preço (Ticker inválido?).")
                 continue
 
             # Chama as IAs
@@ -137,7 +141,7 @@ def run_market_update():
                     "news": news,
                     "aid": asset.id
                 })
-            print(f"✅ R$ {current_price} | IA: {analysis[:15]}...")
+            print(f"✅ R$ {current_price} | IA: OK")
             
         except Exception as e:
             print(f"❌ Erro: {e}")
