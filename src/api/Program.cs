@@ -9,31 +9,40 @@ var builder = WebApplication.CreateBuilder(args);
 var port = Environment.GetEnvironmentVariable("PORT") ?? "5000";
 builder.WebHost.ConfigureKestrel(options => options.ListenAnyIP(int.Parse(port)));
 
-// --- 2. SERVIÇOS E CORS ---
-var connectionString = "Host=shuttle.proxy.rlwy.net;Port=12070;Database=railway;Username=postgres;Password=bryYtZCTlvOwzAodgPAdjLQJbFTxGSzk";
+// --- 2. BANCO DE DADOS (IMPORTANTE) ---
+// Tenta pegar a variável da Railway primeiro. Se não tiver, usa a sua string fixa de backup.
+var dbUrl = Environment.GetEnvironmentVariable("DATABASE_URL");
+var connectionString = string.IsNullOrEmpty(dbUrl) 
+    ? "Host=shuttle.proxy.rlwy.net;Port=12070;Database=railway;Username=postgres;Password=bryYtZCTlvOwzAodgPAdjLQJbFTxGSzk"
+    : dbUrl;
+
 builder.Services.AddNpgsqlDataSource(connectionString);
 builder.Services.AddControllers();
 
-// Configuração permissiva para evitar bloqueio no Frontend
+// CORS Liberado
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowAll", policy => 
-        policy.AllowAnyOrigin()
-              .AllowAnyMethod()
-              .AllowAnyHeader());
+        policy.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader());
 });
 
 var app = builder.Build();
 
-// --- 3. AUTO-MIGRATION (CORREÇÃO DO BANCO) ---
-using (var scope = app.Services.CreateScope())
+app.UseCors("AllowAll");
+app.MapControllers();
+
+// --- 3. ENDPOINTS ---
+
+app.MapGet("/", () => "API Smart Trader Online 🚀");
+
+// *** NOVO: Endpoint de Emergência para Criar Tabelas ***
+// Se der erro 500, acesse: /api/reset no navegador
+app.MapGet("/api/reset", async (NpgsqlDataSource dataSource) =>
 {
     try 
     {
-        var dataSource = scope.ServiceProvider.GetRequiredService<NpgsqlDataSource>();
         using var conn = await dataSource.OpenConnectionAsync();
         
-        // Cria tabelas essenciais se não existirem
         await conn.ExecuteAsync(@"
             CREATE TABLE IF NOT EXISTS user_favorites (
                 id SERIAL PRIMARY KEY,
@@ -62,25 +71,19 @@ using (var scope = app.Services.CreateScope())
             );
         ");
 
-        // Insere dados iniciais para evitar tela em branco
+        // Insere dados de teste
         await conn.ExecuteAsync("INSERT INTO sectors (name) VALUES ('Geral') ON CONFLICT DO NOTHING;");
-        await conn.ExecuteAsync("INSERT INTO assets (ticker, name, sector_id) VALUES ('PETR4.SA', 'Petrobras', 1), ('VALE3.SA', 'Vale', 1) ON CONFLICT (ticker) DO NOTHING;");
+        await conn.ExecuteAsync("INSERT INTO assets (ticker, name) VALUES ('PETR4.SA', 'Petrobras'), ('VALE3.SA', 'Vale') ON CONFLICT (ticker) DO NOTHING;");
         
-        Console.WriteLine("✅ Banco de dados corrigido com sucesso!");
+        return Results.Ok("SUCESSO: Tabelas Recriadas e Dados Inseridos! Volte para o Dashboard.");
     }
-    catch (Exception ex) 
+    catch (Exception ex)
     {
-        Console.WriteLine($"❌ Erro na Migration: {ex.Message}");
+        return Results.Problem($"ERRO CRÍTICO NO BANCO: {ex.Message}");
     }
-}
+});
 
-// --- 4. ENDPOINTS ---
-app.UseCors("AllowAll"); // Importante: Deve vir antes de MapControllers
-app.MapControllers();
-
-app.MapGet("/", () => "API Online e Banco Atualizado 🚀");
-
-// Endpoint Blindado (Usa LEFT JOIN para não travar se faltar análise)
+// Endpoint Principal (Dashboard)
 app.MapGet("/api/favorites", async (NpgsqlDataSource dataSource) =>
 {
     using var conn = await dataSource.OpenConnectionAsync();
@@ -90,7 +93,7 @@ app.MapGet("/api/favorites", async (NpgsqlDataSource dataSource) =>
             COALESCE(a.price, 0) as Price, 
             a.pe_ratio as PeRatio, 
             a.dy_percentage as DyPercentage, 
-            COALESCE(a.ai_analysis, 'Processando...') as AiAnalysis, 
+            COALESCE(a.ai_analysis, 'Aguardando Worker...') as AiAnalysis, 
             a.news_summary as NewsSummary
         FROM user_favorites f
         LEFT JOIN assets a ON f.ticker = a.ticker
@@ -104,13 +107,12 @@ app.MapPost("/api/favorites/{ticker}", async (string ticker, NpgsqlDataSource da
 {
     using var conn = await dataSource.OpenConnectionAsync();
     var cleanTicker = ticker.Trim().ToUpper();
-    // Adiciona aos favoritos
     await conn.ExecuteAsync("INSERT INTO user_favorites (ticker) VALUES (@T) ON CONFLICT (ticker) DO NOTHING", new { T = cleanTicker });
-    // Adiciona na tabela de ativos para o Worker processar depois
     await conn.ExecuteAsync("INSERT INTO assets (ticker, name) VALUES (@T, 'Novo') ON CONFLICT (ticker) DO NOTHING", new { T = cleanTicker });
     return Results.Ok();
 });
 
+// Remover Favorito
 app.MapDelete("/api/favorites/{ticker}", async (string ticker, NpgsqlDataSource dataSource) =>
 {
     using var conn = await dataSource.OpenConnectionAsync();
