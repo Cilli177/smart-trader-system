@@ -1,6 +1,7 @@
 @page "/"
 @inject HttpClient Http
 @inject IJSRuntime JS
+@using System.Text.RegularExpressions
 
 <PageTitle>Smart Trader Dashboard</PageTitle>
 
@@ -34,7 +35,7 @@
                         <th>Preço</th>
                         <th>P/L</th>
                         <th>Resumo IA (50w)</th>
-                        <th>Notícias</th>
+                        <th>Notícias & Fontes</th>
                         <th>Ações</th>
                     </tr>
                 </thead>
@@ -45,15 +46,31 @@
                             <td class="fw-bold">@item.Ticker</td>
                             <td>R$ @(item.Price.ToString("N2"))</td>
                             <td>@(item.PeRatio.ToString("N2"))</td>
+                            
                             <td class="small" style="max-width: 300px;">
-                                @item.AiAnalysis
+                                @if (item.AiAnalysis.Contains("429"))
+                                {
+                                    <span class="text-warning fw-bold">⚠️ @item.AiAnalysis</span>
+                                }
+                                else if (item.AiAnalysis.Contains("Erro"))
+                                {
+                                    <span class="text-danger">@item.AiAnalysis</span>
+                                }
+                                else
+                                {
+                                    @item.AiAnalysis
+                                }
                                 <br/>
                                 <button class="btn btn-link btn-sm p-0 mt-1 text-decoration-none fw-bold" 
                                         @onclick="() => OpenModal(item)">
                                     📊 Ver Análise Completa
                                 </button>
                             </td>
-                            <td class="small text-muted" style="max-width: 250px;">@item.NewsSummary</td>
+
+                            <td class="small text-muted" style="max-width: 300px; font-size: 0.85rem;">
+                                @((MarkupString)FormatNews(item.NewsSummary))
+                            </td>
+
                             <td>
                                 <button class="btn btn-sm btn-outline-danger" @onclick="() => Remove(item.Ticker)">X</button>
                             </td>
@@ -74,8 +91,8 @@
                     <h5 class="modal-title">📈 Análise Profunda: <strong>@selectedAsset.Ticker</strong></h5>
                     <button type="button" class="btn-close" @onclick="CloseModal"></button>
                 </div>
-                <div class="modal-body" style="white-space: pre-wrap;">
-                    @selectedAsset.FullReport
+                <div class="modal-body" style="white-space: pre-wrap; font-family: sans-serif; line-height: 1.6;">
+                    @((MarkupString)FormatFullReport(selectedAsset.FullReport))
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn btn-secondary" @onclick="CloseModal">Fechar</button>
@@ -88,7 +105,7 @@
 @code {
     private string tickerInput = "";
     private List<AssetDto>? assets;
-    private AssetDto? selectedAsset; // Ativo selecionado para o modal
+    private AssetDto? selectedAsset;
     private bool isLoading = true;
     private string? errorMessage;
 
@@ -121,9 +138,35 @@
 
     private async Task HandleKey(KeyboardEventArgs e) { if (e.Key == "Enter") await AddFavorite(); }
 
-    // Controle do Modal
     private void OpenModal(AssetDto asset) => selectedAsset = asset;
     private void CloseModal() => selectedAsset = null;
+
+    // --- MAGIA DOS LINKS CLICÁVEIS ---
+    private string FormatNews(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return "Sem notícias.";
+        
+        // 1. Quebra linhas para ficar bonito
+        var html = text.Replace("\n", "<br/>");
+
+        // 2. Regex para encontrar URLs e transformar em Links
+        // Padrão: [N] http://...
+        string pattern = @"(\[\d+\])\s*(https?://[^\s<]+)";
+        html = Regex.Replace(html, pattern, m => 
+            $"{m.Groups[1].Value} <a href=\"{m.Groups[2].Value}\" target=\"_blank\" class=\"text-primary text-decoration-underline\">Ver Fonte 🔗</a>"
+        );
+
+        return html;
+    }
+
+    // Formata o relatório para negrito funcionar se a IA mandar markdown
+    private string FormatFullReport(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return "Carregando detalhes...";
+        // Transforma **Texto** em <b>Texto</b>
+        var html = Regex.Replace(text, @"\*\*(.*?)\*\*", "<b>$1</b>");
+        return html;
+    }
 
     public class AssetDto
     {
@@ -132,7 +175,7 @@
         public decimal PeRatio { get; set; }
         public decimal DyPercentage { get; set; }
         public string AiAnalysis { get; set; } = "";
-        public string FullReport { get; set; } = ""; // Dado Completo
+        public string FullReport { get; set; } = "";
         public string NewsSummary { get; set; } = "";
     }
 }
