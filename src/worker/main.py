@@ -6,7 +6,7 @@ import requests
 import json
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Carrega variáveis
 load_dotenv()
@@ -22,7 +22,7 @@ engine = create_engine(DB_URL)
 CACHED_MODEL_NAME = None
 
 def ensure_schema():
-    print("🔧 Schema check (V16)...")
+    print("🔧 Schema check (V17)...")
     with engine.begin() as conn:
         try:
             conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS price DECIMAL(18, 2) DEFAULT 0;"))
@@ -79,8 +79,8 @@ def get_ai_analysis(ticker, info):
     headers = {'Content-Type': 'application/json'}
     data = {"contents": [{"parts": [{"text": prompt}]}]}
     
-    # --- SMART RETRY (TENTA ATÉ 3 VEZES SE DER 429) ---
-    max_retries = 3
+    # --- SMART RETRY (V17 - Aumentado para 4 tentativas e espera maior) ---
+    max_retries = 4
     for attempt in range(max_retries):
         try:
             response = requests.post(url, headers=headers, json=data, timeout=40)
@@ -92,12 +92,13 @@ def get_ai_analysis(ticker, info):
                     json_data = json.loads(text_resp)
                     return (json_data.get("summary", "Erro resumo"), json_data.get("full_report", "Erro detalhe"))
                 except:
-                    return ("Erro JSON", text_resp) # Retorna texto puro se falhar o JSON
+                    return ("Erro JSON", text_resp)
             
             elif response.status_code == 429:
-                print(f"⏳ Cota excedida (429). Esperando 60s para tentar de novo...")
-                time.sleep(60) # Pausa longa para recuperar a cota
-                continue # Tenta de novo
+                wait_time = 60 * (attempt + 1) # Espera progressiva: 60s, 120s, 180s...
+                print(f"⏳ Cota 429. Esperando {wait_time}s...")
+                time.sleep(wait_time)
+                continue
             
             else:
                 return (f"Erro {response.status_code}", "")
@@ -105,7 +106,7 @@ def get_ai_analysis(ticker, info):
         except Exception as e:
             return (f"Erro: {str(e)[:20]}", "")
             
-    return ("Erro 429 Persistente", "Tente mais tarde.")
+    return ("Erro 429 Persistente", "Cota diária excedida ou API sobrecarregada.")
 
 def get_news_from_perplexity(ticker):
     if not PERPLEXITY_KEY: return "Sem chave News"
@@ -127,17 +128,32 @@ def fix_ticker(ticker):
     return ticker
 
 def run_market_update():
-    print(f"\n--- 🚀 V16 (Smart Retry Anti-429): {datetime.now()} ---")
+    print(f"\n--- 🚀 V17 (Smart Queue - Econômico): {datetime.now()} ---")
     try:
         with engine.connect() as conn:
-            assets = conn.execute(text("SELECT id, ticker FROM assets")).fetchall()
+            # Pega também a última atualização e a análise atual
+            assets = conn.execute(text("SELECT id, ticker, ai_analysis, last_update FROM assets")).fetchall()
     except Exception as e:
         print(f"❌ Erro Banco: {e}")
         return
 
     for asset in assets:
         real_ticker = fix_ticker(asset.ticker)
-        print(f"🔄 {real_ticker}...", end=" ")
+        
+        # --- LÓGICA DE ECONOMIA (O PULO DO GATO) ---
+        # Se já tem análise válida (não é erro) e foi atualizado há menos de 4 horas -> PULA
+        last_up = asset.last_update
+        current_ai = asset.ai_analysis or ""
+        
+        is_recent = last_up and (datetime.now() - last_up).total_seconds() < 14400 # 4 horas
+        has_valid_ai = "Erro" not in current_ai and "FALHA" not in current_ai and len(current_ai) > 10
+        
+        if is_recent and has_valid_ai:
+            print(f"⏭️ {real_ticker} já atualizado. Pulando para economizar IA.")
+            continue
+        
+        # Se chegou aqui, precisa atualizar
+        print(f"🔄 Atualizando {real_ticker}...", end=" ")
         
         try:
             t = yf.Ticker(real_ticker)
@@ -148,7 +164,6 @@ def run_market_update():
                 print("⚠️ Sem preço.")
                 continue
 
-            # Chama IA (Com retry embutido)
             summary, full_report = get_ai_analysis(real_ticker, info)
             news = get_news_from_perplexity(real_ticker)
             
@@ -168,10 +183,11 @@ def run_market_update():
                     "news": news,
                     "aid": asset.id
                 })
-            print(f"✅ R$ {current_price} | IA: {summary[:15]}...")
+            print(f"✅ Feito! IA: {summary[:10]}...")
             
-            # Pausa padrão entre ações (aumentei para 10s por segurança)
-            time.sleep(10) 
+            # Pausa Segura entre requisições (20 segundos = 3 requisições/minuto)
+            # Isso é super seguro para contas Free
+            time.sleep(20) 
             
         except Exception as e:
             print(f"❌ Erro: {e}")
