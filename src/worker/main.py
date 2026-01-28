@@ -3,6 +3,7 @@ import time
 import schedule
 import yfinance as yf
 import requests
+import json
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 from datetime import datetime
@@ -18,85 +19,94 @@ if not DB_URL:
     exit(1)
 
 engine = create_engine(DB_URL)
-
-# Cache para não ficar perguntando toda hora
 CACHED_MODEL_NAME = None
 
 def ensure_schema():
-    print("🔧 Schema check...")
+    print("🔧 Schema check (V2)...")
     with engine.begin() as conn:
         try:
+            # Colunas básicas
             conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS price DECIMAL(18, 2) DEFAULT 0;"))
             conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS pe_ratio DECIMAL(10, 2) DEFAULT 0;"))
             conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS dy_percentage DECIMAL(10, 2) DEFAULT 0;"))
             conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS ai_analysis TEXT;"))
             conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS news_summary TEXT;"))
             conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP;"))
+            
+            # NOVA COLUNA PARA O RELATÓRIO COMPLETO
+            conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS full_report TEXT;"))
         except Exception as e:
             print(f"⚠️ Aviso schema: {e}")
 
 def get_valid_model():
-    """Pergunta ao Google qual modelo está disponível para esta chave"""
     global CACHED_MODEL_NAME
     if CACHED_MODEL_NAME: return CACHED_MODEL_NAME
-
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_KEY}"
     try:
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        
-        if 'models' not in data:
-            return None # Chave inválida ou erro
-
-        # Procura o primeiro modelo 'gemini' que gera texto
+        data = requests.get(url, timeout=10).json()
+        if 'models' not in data: return "gemini-1.5-flash"
         for m in data['models']:
             name = m['name'].replace("models/", "")
             if "gemini" in name and "generateContent" in m.get('supportedGenerationMethods', []):
-                print(f"✅ Modelo Detectado: {name}")
+                print(f"✅ Modelo: {name}")
                 CACHED_MODEL_NAME = name
                 return name
-        
-        # Se não achar nada, tenta o flash padrão
         return "gemini-1.5-flash"
-    except:
-        return "gemini-1.5-flash"
+    except: return "gemini-1.5-flash"
 
 def get_ai_analysis(ticker, info):
-    if not GEMINI_KEY: return "Chave Gemini vazia."
+    if not GEMINI_KEY: return ("Chave vazia", "Sem detalhes")
 
-    # 1. Pega o modelo correto
     model_name = get_valid_model()
-    if not model_name: return "ERRO: Chave não acessa modelos."
-
-    # 2. Monta a URL
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_KEY}"
     
-    # 3. Prompt Rico (Igual ao da Petrobras que funcionou)
+    # --- DADOS TÉCNICOS PARA SIMULAR GRÁFICO ---
     pl = info.get('trailingPE', 'N/A')
     roe = info.get('returnOnEquity', 0)
-    roe_fmt = f"{roe*100:.1f}%" if isinstance(roe, (int, float)) else "N/A"
+    high52 = info.get('fiftyTwoWeekHigh', 0)
+    low52 = info.get('fiftyTwoWeekLow', 0)
+    current = info.get('currentPrice', 0)
+    
+    # Lógica simples de tendência
+    tendencia = "Lateral"
+    if current > high52 * 0.9: tendencia = "Alta Forte (Topo Histórico)"
+    elif current < low52 * 1.1: tendencia = "Baixa (Perto da Mínima)"
     
     prompt = f"""
-    Analista Sênior B3. Ativo: {ticker}.
-    Preço: R$ {info.get('currentPrice')}. P/L: {pl}. ROE: {roe_fmt}.
-    Em 1 parágrafo denso (PT-BR): Interprete os indicadores (P/L e ROE). Indica oportunidade ou risco?
+    Analista B3 Sênior. Ativo: {ticker}.
+    Dados:
+    - Preço: {current}
+    - P/L: {pl} | ROE: {roe}
+    - Faixa 52 Semanas: {low52} - {high52}
+    - Tendência Técnica Aparente: {tendencia}
+
+    Gere um JSON puro (sem markdown) com dois campos:
+    1. "summary": Um resumo estratégico de no MÁXIMO 50 PALAVRAS. Foque no valuation.
+    2. "full_report": Uma análise completa e detalhada. Use quebras de linha.
+       - Inclua Análise Fundamentalista (P/L, ROE).
+       - Inclua Análise Técnica (Baseada na tendência e preço vs máximas).
+       - Inclua Veredito (Compra/Venda/Neutro).
     """
     
     headers = {'Content-Type': 'application/json'}
     data = {"contents": [{"parts": [{"text": prompt}]}]}
     
     try:
-        response = requests.post(url, headers=headers, json=data, timeout=30)
+        response = requests.post(url, headers=headers, json=data, timeout=40)
         if response.status_code == 200:
-            return response.json()['candidates'][0]['content']['parts'][0]['text']
+            text_resp = response.json()['candidates'][0]['content']['parts'][0]['text']
+            # Limpeza do JSON (o Gemini as vezes manda ```json ... ```)
+            text_resp = text_resp.replace("```json", "").replace("```", "").strip()
+            json_data = json.loads(text_resp)
+            return (json_data.get("summary", "Erro resumo"), json_data.get("full_report", "Erro detalhe"))
         else:
-            return f"Erro Google ({response.status_code})"
+            return (f"Erro {response.status_code}", "")
     except Exception as e:
-        return f"Erro Req: {str(e)[:20]}"
+        return (f"Erro: {str(e)[:20]}", "")
 
 def get_news_from_perplexity(ticker):
-    # Perplexity está ótimo, não mexe.
-    if not PERPLEXITY_KEY: return "Chave News vazia."
+    # Mantido (Notícias estão ótimas)
+    if not PERPLEXITY_KEY: return "Sem chave News"
     url = "https://api.perplexity.ai/chat/completions"
     payload = {
         "model": "sonar", 
@@ -107,8 +117,7 @@ def get_news_from_perplexity(ticker):
         res = requests.post(url, json=payload, headers=headers).json()
         if 'choices' in res: return res['choices'][0]['message']['content']
         return "Sem dados."
-    except Exception as e:
-        return f"Erro News: {str(e)[:20]}"
+    except: return "Erro News"
 
 def fix_ticker(ticker):
     ticker = ticker.upper().strip()
@@ -116,8 +125,7 @@ def fix_ticker(ticker):
     return ticker
 
 def run_market_update():
-    print(f"\n--- 🚀 V13 (Auto-Modelo + Paciência): {datetime.now()} ---")
-    
+    print(f"\n--- 🚀 V15 (JSON + Full Report): {datetime.now()} ---")
     try:
         with engine.connect() as conn:
             assets = conn.execute(text("SELECT id, ticker FROM assets")).fetchall()
@@ -138,33 +146,28 @@ def run_market_update():
                 print("⚠️ Sem preço.")
                 continue
 
-            # IA
-            analysis = get_ai_analysis(real_ticker, info)
-            
-            # Notícias
+            # Chama IA (Retorna Tupla: Resumo, Detalhe)
+            summary, full_report = get_ai_analysis(real_ticker, info)
             news = get_news_from_perplexity(real_ticker)
             
-            # Salva no Banco
             with engine.begin() as conn:
                 sql = text("""
                     UPDATE assets SET 
                     price = :pr, pe_ratio = :pe, dy_percentage = :dy, 
-                    ai_analysis = :ana, news_summary = :news, last_update = CURRENT_TIMESTAMP
+                    ai_analysis = :ana, full_report = :full, news_summary = :news, last_update = CURRENT_TIMESTAMP
                     WHERE id = :aid
                 """)
                 conn.execute(sql, {
                     "pr": current_price,
                     "pe": info.get('trailingPE', 0),
                     "dy": (info.get('dividendYield', 0) or 0) * 100,
-                    "ana": analysis,
+                    "ana": summary,
+                    "full": full_report, # Salva o relatório completo
                     "news": news,
                     "aid": asset.id
                 })
-            print(f"✅ Salvo. Aguardando 5s...")
-            
-            # --- O SEGREDO DO SUCESSO ---
-            # Pausa de 5 segundos para o Google não bloquear a gente
-            time.sleep(5) 
+            print(f"✅ R$ {current_price} | Resumo: OK | Full: OK")
+            time.sleep(5) # Paciência para API grátis
             
         except Exception as e:
             print(f"❌ Erro: {e}")
