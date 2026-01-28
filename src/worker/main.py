@@ -21,6 +21,9 @@ if not DB_URL:
 
 engine = create_engine(DB_URL)
 
+# Variável para guardar o modelo que funciona (Cache)
+CURRENT_VALID_MODEL = None
+
 def ensure_schema():
     print("🔧 Schema check...")
     with engine.begin() as conn:
@@ -34,51 +37,73 @@ def ensure_schema():
         except Exception as e:
             print(f"⚠️ Aviso schema: {e}")
 
+def find_available_model():
+    """PERGUNTA AO GOOGLE QUAIS MODELOS A CHAVE TEM ACESSO"""
+    global CURRENT_VALID_MODEL
+    if CURRENT_VALID_MODEL: return CURRENT_VALID_MODEL
+
+    print("🔍 Buscando modelos disponíveis na sua conta Google...")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_KEY}"
+    
+    try:
+        res = requests.get(url, timeout=10).json()
+        
+        if 'error' in res:
+            print(f"❌ Erro ao listar modelos: {res['error']['message']}")
+            return None
+            
+        # Procura um modelo que sirva para gerar texto
+        for m in res.get('models', []):
+            name = m['name'] # ex: models/gemini-1.5-flash
+            methods = m.get('supportedGenerationMethods', [])
+            
+            # Prioridade para modelos Flash ou Pro
+            if 'generateContent' in methods:
+                print(f"✅ Modelo Encontrado: {name}")
+                CURRENT_VALID_MODEL = name
+                return name
+                
+    except Exception as e:
+        print(f"❌ Erro na Auto-Descoberta: {e}")
+    
+    # Fallback se a descoberta falhar
+    return "models/gemini-1.5-flash"
+
 def get_ai_analysis(ticker, info):
-    """Tanque de Guerra: Tenta 3 modelos diferentes até funcionar"""
     if not GEMINI_KEY: return "ERRO: Chave Gemini vazia."
 
-    # LISTA DE TENTATIVAS (Nome do Modelo, Versão da API)
-    attempts = [
-        ("gemini-1.5-flash", "v1beta"),
-        ("gemini-1.5-flash-latest", "v1beta"),
-        ("gemini-pro", "v1beta")  # O "Fusca" das IAs: Velho mas não quebra
-    ]
+    # 1. Descobre qual modelo usar
+    model_name = find_available_model()
+    if not model_name: return "ERRO: Nenhum modelo disponível na sua conta."
+
+    # 2. Monta a URL com o modelo descoberto
+    # O model_name já vem como "models/nome", então a URL fica correta
+    url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:generateContent?key={GEMINI_KEY}"
     
     prompt = f"""
-    Aja como analista financeiro senior.
     Ativo: {ticker}. Preço: R$ {info.get('currentPrice')}. P/L: {info.get('trailingPE')}.
-    Responda em 1 frase curta (max 20 palavras): O preço atual é uma oportunidade de compra ou venda?
+    Responda em 1 frase curta: O indicador P/L indica oportunidade ou risco?
     """
     
-    last_error = ""
-
-    for model, version in attempts:
-        url = f"https://generativelanguage.googleapis.com/{version}/models/{model}:generateContent?key={GEMINI_KEY}"
-        headers = {'Content-Type': 'application/json'}
-        data = {"contents": [{"parts": [{"text": prompt}]}]}
+    headers = {'Content-Type': 'application/json'}
+    data = {"contents": [{"parts": [{"text": prompt}]}]}
+    
+    try:
+        response = requests.post(url, headers=headers, json=data, timeout=10)
         
-        try:
-            response = requests.post(url, headers=headers, json=data, timeout=10)
+        if response.status_code == 200:
+            return response.json()['candidates'][0]['content']['parts'][0]['text']
+        else:
+            return f"Erro Google ({response.status_code}): {response.text[:40]}"
             
-            if response.status_code == 200:
-                # SUCESSO!
-                return response.json()['candidates'][0]['content']['parts'][0]['text']
-            else:
-                last_error = f"{model}: {response.status_code}"
-                continue # Tenta o próximo modelo da lista
-                
-        except Exception as e:
-            last_error = str(e)
-
-    return f"FALHA TOTAL: {last_error}"
+    except Exception as e:
+        return f"Erro Request: {str(e)[:30]}"
 
 def get_news_from_perplexity(ticker):
-    # Essa função já está funcionando PERFEITA, não mudei nada.
+    # MANTIDO IGUAL - ESTÁ FUNCIONANDO PERFEITAMENTE
     if not PERPLEXITY_KEY: return "ERRO: Chave News vazia."
     
     url = "https://api.perplexity.ai/chat/completions"
-    
     payload = {
         "model": "sonar", 
         "messages": [{"role": "user", "content": f"Manchete mais importante de {ticker} hoje (1 frase)."}]
@@ -99,7 +124,7 @@ def fix_ticker(ticker):
     return ticker
 
 def run_market_update():
-    print(f"\n--- 🚀 Tanque de Guerra V7: {datetime.now()} ---")
+    print(f"\n--- 🚀 Inteligência V8 (Auto-Discovery): {datetime.now()} ---")
     
     try:
         with engine.connect() as conn:
