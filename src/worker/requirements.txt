@@ -3,6 +3,6 @@ pandas
 sqlalchemy
 psycopg2-binary
 schedule
-google-generativeai
+google-genai
 requests
 python-dotenv
