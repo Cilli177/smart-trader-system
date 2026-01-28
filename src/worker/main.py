@@ -35,39 +35,50 @@ def ensure_schema():
             print(f"⚠️ Aviso schema: {e}")
 
 def get_ai_analysis(ticker, info):
+    """Tanque de Guerra: Tenta 3 modelos diferentes até funcionar"""
     if not GEMINI_KEY: return "ERRO: Chave Gemini vazia."
 
-    # MUDANÇA 1: Usando API v1 (Estável) e modelo gemini-1.5-flash
-    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
+    # LISTA DE TENTATIVAS (Nome do Modelo, Versão da API)
+    attempts = [
+        ("gemini-1.5-flash", "v1beta"),
+        ("gemini-1.5-flash-latest", "v1beta"),
+        ("gemini-pro", "v1beta")  # O "Fusca" das IAs: Velho mas não quebra
+    ]
     
     prompt = f"""
-    Aja como analista de mercado B3.
+    Aja como analista financeiro senior.
     Ativo: {ticker}. Preço: R$ {info.get('currentPrice')}. P/L: {info.get('trailingPE')}.
-    Responda em 1 frase (max 20 palavras): O preço atual é uma oportunidade?
+    Responda em 1 frase curta (max 20 palavras): O preço atual é uma oportunidade de compra ou venda?
     """
     
-    headers = {'Content-Type': 'application/json'}
-    data = {"contents": [{"parts": [{"text": prompt}]}]}
-    
-    try:
-        response = requests.post(url, headers=headers, json=data, timeout=10)
+    last_error = ""
+
+    for model, version in attempts:
+        url = f"https://generativelanguage.googleapis.com/{version}/models/{model}:generateContent?key={GEMINI_KEY}"
+        headers = {'Content-Type': 'application/json'}
+        data = {"contents": [{"parts": [{"text": prompt}]}]}
         
-        if response.status_code == 200:
-            return response.json()['candidates'][0]['content']['parts'][0]['text']
-        else:
-            error_json = response.json()
-            msg = error_json.get('error', {}).get('message', 'Erro desconhecido')
-            return f"Google {response.status_code}: {msg[:50]}" # Corta msg longa
+        try:
+            response = requests.post(url, headers=headers, json=data, timeout=10)
             
-    except Exception as e:
-        return f"Erro Request: {str(e)[:30]}"
+            if response.status_code == 200:
+                # SUCESSO!
+                return response.json()['candidates'][0]['content']['parts'][0]['text']
+            else:
+                last_error = f"{model}: {response.status_code}"
+                continue # Tenta o próximo modelo da lista
+                
+        except Exception as e:
+            last_error = str(e)
+
+    return f"FALHA TOTAL: {last_error}"
 
 def get_news_from_perplexity(ticker):
+    # Essa função já está funcionando PERFEITA, não mudei nada.
     if not PERPLEXITY_KEY: return "ERRO: Chave News vazia."
     
     url = "https://api.perplexity.ai/chat/completions"
     
-    # MUDANÇA 2: Nome do modelo atualizado para 'sonar'
     payload = {
         "model": "sonar", 
         "messages": [{"role": "user", "content": f"Manchete mais importante de {ticker} hoje (1 frase)."}]
@@ -76,14 +87,8 @@ def get_news_from_perplexity(ticker):
     
     try:
         res = requests.post(url, json=payload, headers=headers).json()
-        
-        # Tratamento de erro específico da Perplexity
-        if 'error' in res:
-             return f"Erro API: {res['error']['message'][:50]}"
-             
-        if 'choices' in res:
-            return res['choices'][0]['message']['content']
-            
+        if 'error' in res: return f"Erro API: {res['error']['message'][:50]}"
+        if 'choices' in res: return res['choices'][0]['message']['content']
         return "Sem dados."
     except Exception as e:
         return f"Erro News: {str(e)[:30]}"
@@ -94,7 +99,7 @@ def fix_ticker(ticker):
     return ticker
 
 def run_market_update():
-    print(f"\n--- 🚀 Correção Modelos: {datetime.now()} ---")
+    print(f"\n--- 🚀 Tanque de Guerra V7: {datetime.now()} ---")
     
     try:
         with engine.connect() as conn:
