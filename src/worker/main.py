@@ -6,7 +6,7 @@ import requests
 import json
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # Carrega variáveis
 load_dotenv()
@@ -22,7 +22,7 @@ engine = create_engine(DB_URL)
 CACHED_MODEL_NAME = None
 
 def ensure_schema():
-    print("🔧 Schema check (V17)...")
+    print("🔧 Schema check (V18)...")
     with engine.begin() as conn:
         try:
             conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS price DECIMAL(18, 2) DEFAULT 0;"))
@@ -56,7 +56,6 @@ def get_ai_analysis(ticker, info):
     model_name = get_valid_model()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_KEY}"
     
-    # Dados Técnicos
     pl = info.get('trailingPE', 'N/A')
     roe = info.get('returnOnEquity', 0)
     high52 = info.get('fiftyTwoWeekHigh', 0)
@@ -64,56 +63,42 @@ def get_ai_analysis(ticker, info):
     current = info.get('currentPrice', 0)
     
     tendencia = "Lateral"
-    if current > high52 * 0.9: tendencia = "Alta Forte (Topo Histórico)"
-    elif current < low52 * 1.1: tendencia = "Baixa (Perto da Mínima)"
+    if current > high52 * 0.9: tendencia = "Alta Forte"
+    elif current < low52 * 1.1: tendencia = "Baixa"
     
     prompt = f"""
-    Analista B3 Sênior. Ativo: {ticker}.
-    Dados: Preço: {current} | P/L: {pl} | ROE: {roe} | Faixa 52 Semanas: {low52}-{high52} | Tendência: {tendencia}
-
-    Gere JSON puro com dois campos:
-    1. "summary": Resumo estratégico (max 40 palavras).
-    2. "full_report": Análise completa com quebras de linha (Fundamentalista + Técnica + Veredito).
+    Analista B3. Ativo: {ticker}. Preço: {current}. P/L: {pl}. ROE: {roe}. Tendência: {tendencia}.
+    JSON campos: "summary" (max 40 palavras), "full_report" (análise completa).
     """
     
     headers = {'Content-Type': 'application/json'}
     data = {"contents": [{"parts": [{"text": prompt}]}]}
     
-    # --- SMART RETRY (V17 - Aumentado para 4 tentativas e espera maior) ---
-    max_retries = 4
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(url, headers=headers, json=data, timeout=40)
+    try:
+        response = requests.post(url, headers=headers, json=data, timeout=30)
+        
+        if response.status_code == 200:
+            text_resp = response.json()['candidates'][0]['content']['parts'][0]['text']
+            text_resp = text_resp.replace("```json", "").replace("```", "").strip()
+            try:
+                json_data = json.loads(text_resp)
+                return (json_data.get("summary", "Erro resumo"), json_data.get("full_report", "Erro detalhe"), 200)
+            except:
+                return ("Erro JSON", text_resp, 200)
+        elif response.status_code == 429:
+            return ("⚠️ Cota Google Excedida", "Aguarde alguns minutos.", 429)
+        else:
+            return (f"Erro Google {response.status_code}", "", response.status_code)
             
-            if response.status_code == 200:
-                text_resp = response.json()['candidates'][0]['content']['parts'][0]['text']
-                text_resp = text_resp.replace("```json", "").replace("```", "").strip()
-                try:
-                    json_data = json.loads(text_resp)
-                    return (json_data.get("summary", "Erro resumo"), json_data.get("full_report", "Erro detalhe"))
-                except:
-                    return ("Erro JSON", text_resp)
-            
-            elif response.status_code == 429:
-                wait_time = 60 * (attempt + 1) # Espera progressiva: 60s, 120s, 180s...
-                print(f"⏳ Cota 429. Esperando {wait_time}s...")
-                time.sleep(wait_time)
-                continue
-            
-            else:
-                return (f"Erro {response.status_code}", "")
-                
-        except Exception as e:
-            return (f"Erro: {str(e)[:20]}", "")
-            
-    return ("Erro 429 Persistente", "Cota diária excedida ou API sobrecarregada.")
+    except Exception as e:
+        return (f"Erro Req: {str(e)[:15]}", "", 500)
 
 def get_news_from_perplexity(ticker):
     if not PERPLEXITY_KEY: return "Sem chave News"
     url = "https://api.perplexity.ai/chat/completions"
     payload = {
         "model": "sonar", 
-        "messages": [{"role": "user", "content": f"Manchete financeira de {ticker} hoje (max 20 palavras)."}]
+        "messages": [{"role": "user", "content": f"Manchete {ticker} hoje (max 20 palavras)."}]
     }
     headers = {"Authorization": f"Bearer {PERPLEXITY_KEY}", "Content-Type": "application/json"}
     try:
@@ -128,34 +113,23 @@ def fix_ticker(ticker):
     return ticker
 
 def run_market_update():
-    print(f"\n--- 🚀 V17 (Smart Queue - Econômico): {datetime.now()} ---")
+    print(f"\n--- 🚀 V18 (Blindado - Preço Primeiro): {datetime.now()} ---")
     try:
         with engine.connect() as conn:
-            # Pega também a última atualização e a análise atual
             assets = conn.execute(text("SELECT id, ticker, ai_analysis, last_update FROM assets")).fetchall()
     except Exception as e:
         print(f"❌ Erro Banco: {e}")
         return
 
+    # Variável para controlar se o Google bloqueou a gente neste ciclo
+    google_blocked = False
+
     for asset in assets:
         real_ticker = fix_ticker(asset.ticker)
-        
-        # --- LÓGICA DE ECONOMIA (O PULO DO GATO) ---
-        # Se já tem análise válida (não é erro) e foi atualizado há menos de 4 horas -> PULA
-        last_up = asset.last_update
-        current_ai = asset.ai_analysis or ""
-        
-        is_recent = last_up and (datetime.now() - last_up).total_seconds() < 14400 # 4 horas
-        has_valid_ai = "Erro" not in current_ai and "FALHA" not in current_ai and len(current_ai) > 10
-        
-        if is_recent and has_valid_ai:
-            print(f"⏭️ {real_ticker} já atualizado. Pulando para economizar IA.")
-            continue
-        
-        # Se chegou aqui, precisa atualizar
-        print(f"🔄 Atualizando {real_ticker}...", end=" ")
+        print(f"🔄 {real_ticker}...", end=" ")
         
         try:
+            # 1. PEGA DADOS DE MERCADO (Isso quase nunca falha)
             t = yf.Ticker(real_ticker)
             info = t.info
             current_price = info.get('currentPrice') or info.get('regularMarketPrice')
@@ -164,31 +138,59 @@ def run_market_update():
                 print("⚠️ Sem preço.")
                 continue
 
-            summary, full_report = get_ai_analysis(real_ticker, info)
+            # 2. SALVA O PREÇO IMEDIATAMENTE (Garante que o BBAS3 saia do 0,00)
             news = get_news_from_perplexity(real_ticker)
             
             with engine.begin() as conn:
-                sql = text("""
+                # Atualiza preço e notícias, mantém IA antiga por enquanto
+                conn.execute(text("""
                     UPDATE assets SET 
-                    price = :pr, pe_ratio = :pe, dy_percentage = :dy, 
-                    ai_analysis = :ana, full_report = :full, news_summary = :news, last_update = CURRENT_TIMESTAMP
+                    price = :pr, pe_ratio = :pe, dy_percentage = :dy, news_summary = :news, last_update = CURRENT_TIMESTAMP
                     WHERE id = :aid
-                """)
-                conn.execute(sql, {
+                """), {
                     "pr": current_price,
                     "pe": info.get('trailingPE', 0),
                     "dy": (info.get('dividendYield', 0) or 0) * 100,
-                    "ana": summary,
-                    "full": full_report,
                     "news": news,
                     "aid": asset.id
                 })
-            print(f"✅ Feito! IA: {summary[:10]}...")
             
-            # Pausa Segura entre requisições (20 segundos = 3 requisições/minuto)
-            # Isso é super seguro para contas Free
-            time.sleep(20) 
+            print(f"💰 Preço salvo (R${current_price}).", end=" ")
+
+            # 3. VERIFICA SE PRECISA/PODE RODAR IA
+            # Se o Google já deu 429 neste ciclo, nem tenta os próximos para não piorar o bloqueio
+            if google_blocked:
+                print("⏭️ Google bloqueado, pulando IA.")
+                continue
+
+            # Lógica de Skip (Se atualizou há menos de 4h e não tem erro, pula)
+            last_up = asset.last_update
+            current_ai = asset.ai_analysis or ""
+            is_recent = last_up and (datetime.now() - last_up).total_seconds() < 14400
+            has_valid_ai = "Erro" not in current_ai and "Cota" not in current_ai and len(current_ai) > 10
+
+            if is_recent and has_valid_ai:
+                print("✅ IA recente. Pulando.")
+                continue
+
+            # 4. TENTA RODAR IA
+            summary, full_report, status_code = get_ai_analysis(real_ticker, info)
             
+            if status_code == 429:
+                print("🛑 429 Detectado! Parando IAs por este ciclo.")
+                google_blocked = True # Ativa a trava de segurança
+                # Salva o aviso de cota excedida
+                with engine.begin() as conn:
+                    conn.execute(text("UPDATE assets SET ai_analysis = :ana WHERE id = :aid"), 
+                                {"ana": "⚠️ Cota Excedida (Tentando mais tarde)", "aid": asset.id})
+            else:
+                # Salva IA com sucesso
+                with engine.begin() as conn:
+                    conn.execute(text("UPDATE assets SET ai_analysis = :ana, full_report = :full WHERE id = :aid"), 
+                                {"ana": summary, "full": full_report, "aid": asset.id})
+                print("✅ IA Atualizada.")
+                time.sleep(15) # Pausa segura
+
         except Exception as e:
             print(f"❌ Erro: {e}")
 
