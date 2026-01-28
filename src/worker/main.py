@@ -22,19 +22,16 @@ engine = create_engine(DB_URL)
 CACHED_MODEL_NAME = None
 
 def ensure_schema():
-    print("🔧 Schema check (V2)...")
+    print("🔧 Schema check (V16)...")
     with engine.begin() as conn:
         try:
-            # Colunas básicas
             conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS price DECIMAL(18, 2) DEFAULT 0;"))
             conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS pe_ratio DECIMAL(10, 2) DEFAULT 0;"))
             conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS dy_percentage DECIMAL(10, 2) DEFAULT 0;"))
             conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS ai_analysis TEXT;"))
+            conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS full_report TEXT;"))
             conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS news_summary TEXT;"))
             conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP;"))
-            
-            # NOVA COLUNA PARA O RELATÓRIO COMPLETO
-            conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS full_report TEXT;"))
         except Exception as e:
             print(f"⚠️ Aviso schema: {e}")
 
@@ -48,7 +45,6 @@ def get_valid_model():
         for m in data['models']:
             name = m['name'].replace("models/", "")
             if "gemini" in name and "generateContent" in m.get('supportedGenerationMethods', []):
-                print(f"✅ Modelo: {name}")
                 CACHED_MODEL_NAME = name
                 return name
         return "gemini-1.5-flash"
@@ -60,57 +56,63 @@ def get_ai_analysis(ticker, info):
     model_name = get_valid_model()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_KEY}"
     
-    # --- DADOS TÉCNICOS PARA SIMULAR GRÁFICO ---
+    # Dados Técnicos
     pl = info.get('trailingPE', 'N/A')
     roe = info.get('returnOnEquity', 0)
     high52 = info.get('fiftyTwoWeekHigh', 0)
     low52 = info.get('fiftyTwoWeekLow', 0)
     current = info.get('currentPrice', 0)
     
-    # Lógica simples de tendência
     tendencia = "Lateral"
     if current > high52 * 0.9: tendencia = "Alta Forte (Topo Histórico)"
     elif current < low52 * 1.1: tendencia = "Baixa (Perto da Mínima)"
     
     prompt = f"""
     Analista B3 Sênior. Ativo: {ticker}.
-    Dados:
-    - Preço: {current}
-    - P/L: {pl} | ROE: {roe}
-    - Faixa 52 Semanas: {low52} - {high52}
-    - Tendência Técnica Aparente: {tendencia}
+    Dados: Preço: {current} | P/L: {pl} | ROE: {roe} | Faixa 52 Semanas: {low52}-{high52} | Tendência: {tendencia}
 
-    Gere um JSON puro (sem markdown) com dois campos:
-    1. "summary": Um resumo estratégico de no MÁXIMO 50 PALAVRAS. Foque no valuation.
-    2. "full_report": Uma análise completa e detalhada. Use quebras de linha.
-       - Inclua Análise Fundamentalista (P/L, ROE).
-       - Inclua Análise Técnica (Baseada na tendência e preço vs máximas).
-       - Inclua Veredito (Compra/Venda/Neutro).
+    Gere JSON puro com dois campos:
+    1. "summary": Resumo estratégico (max 40 palavras).
+    2. "full_report": Análise completa com quebras de linha (Fundamentalista + Técnica + Veredito).
     """
     
     headers = {'Content-Type': 'application/json'}
     data = {"contents": [{"parts": [{"text": prompt}]}]}
     
-    try:
-        response = requests.post(url, headers=headers, json=data, timeout=40)
-        if response.status_code == 200:
-            text_resp = response.json()['candidates'][0]['content']['parts'][0]['text']
-            # Limpeza do JSON (o Gemini as vezes manda ```json ... ```)
-            text_resp = text_resp.replace("```json", "").replace("```", "").strip()
-            json_data = json.loads(text_resp)
-            return (json_data.get("summary", "Erro resumo"), json_data.get("full_report", "Erro detalhe"))
-        else:
-            return (f"Erro {response.status_code}", "")
-    except Exception as e:
-        return (f"Erro: {str(e)[:20]}", "")
+    # --- SMART RETRY (TENTA ATÉ 3 VEZES SE DER 429) ---
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, headers=headers, json=data, timeout=40)
+            
+            if response.status_code == 200:
+                text_resp = response.json()['candidates'][0]['content']['parts'][0]['text']
+                text_resp = text_resp.replace("```json", "").replace("```", "").strip()
+                try:
+                    json_data = json.loads(text_resp)
+                    return (json_data.get("summary", "Erro resumo"), json_data.get("full_report", "Erro detalhe"))
+                except:
+                    return ("Erro JSON", text_resp) # Retorna texto puro se falhar o JSON
+            
+            elif response.status_code == 429:
+                print(f"⏳ Cota excedida (429). Esperando 60s para tentar de novo...")
+                time.sleep(60) # Pausa longa para recuperar a cota
+                continue # Tenta de novo
+            
+            else:
+                return (f"Erro {response.status_code}", "")
+                
+        except Exception as e:
+            return (f"Erro: {str(e)[:20]}", "")
+            
+    return ("Erro 429 Persistente", "Tente mais tarde.")
 
 def get_news_from_perplexity(ticker):
-    # Mantido (Notícias estão ótimas)
     if not PERPLEXITY_KEY: return "Sem chave News"
     url = "https://api.perplexity.ai/chat/completions"
     payload = {
         "model": "sonar", 
-        "messages": [{"role": "user", "content": f"Manchete financeira importante de {ticker} hoje (max 20 palavras)."}]
+        "messages": [{"role": "user", "content": f"Manchete financeira de {ticker} hoje (max 20 palavras)."}]
     }
     headers = {"Authorization": f"Bearer {PERPLEXITY_KEY}", "Content-Type": "application/json"}
     try:
@@ -125,7 +127,7 @@ def fix_ticker(ticker):
     return ticker
 
 def run_market_update():
-    print(f"\n--- 🚀 V15 (JSON + Full Report): {datetime.now()} ---")
+    print(f"\n--- 🚀 V16 (Smart Retry Anti-429): {datetime.now()} ---")
     try:
         with engine.connect() as conn:
             assets = conn.execute(text("SELECT id, ticker FROM assets")).fetchall()
@@ -146,7 +148,7 @@ def run_market_update():
                 print("⚠️ Sem preço.")
                 continue
 
-            # Chama IA (Retorna Tupla: Resumo, Detalhe)
+            # Chama IA (Com retry embutido)
             summary, full_report = get_ai_analysis(real_ticker, info)
             news = get_news_from_perplexity(real_ticker)
             
@@ -162,12 +164,14 @@ def run_market_update():
                     "pe": info.get('trailingPE', 0),
                     "dy": (info.get('dividendYield', 0) or 0) * 100,
                     "ana": summary,
-                    "full": full_report, # Salva o relatório completo
+                    "full": full_report,
                     "news": news,
                     "aid": asset.id
                 })
-            print(f"✅ R$ {current_price} | Resumo: OK | Full: OK")
-            time.sleep(5) # Paciência para API grátis
+            print(f"✅ R$ {current_price} | IA: {summary[:15]}...")
+            
+            # Pausa padrão entre ações (aumentei para 10s por segurança)
+            time.sleep(10) 
             
         except Exception as e:
             print(f"❌ Erro: {e}")
