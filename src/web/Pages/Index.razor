@@ -1,207 +1,264 @@
-@page "/"
-@inject HttpClient Http
-@inject IJSRuntime JS
-@using System.Text.RegularExpressions
+import os
+import time
+import schedule
+import yfinance as yf
+import requests
+import json
+from sqlalchemy import create_engine, text
+from dotenv import load_dotenv
+from datetime import datetime
 
-<PageTitle>Smart Trader Dashboard</PageTitle>
+# --- CONFIGURAÇÃO INICIAL ---
+load_dotenv()
+DB_URL = os.getenv("DATABASE_URL")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").replace('"', '').replace("'", "").strip()
+PERPLEXITY_KEY = os.getenv("PERPLEXITY_API_KEY", "").replace('"', '').replace("'", "").strip()
 
-<style>
-    .price-tag { font-family: 'Segoe UI', sans-serif; font-weight: 700; color: #212529; font-size: 1.1rem; }
-    .ticker-tag { font-weight: 800; color: #1a1a1a; font-size: 1rem; }
-    .status-header { font-weight: 700; font-size: 0.95rem; margin-right: 6px; }
-    .status-body { color: #495057; font-size: 0.9rem; line-height: 1.4; }
+if not DB_URL:
+    print("❌ ERRO: DATABASE_URL não definida!")
+    exit(1)
+
+engine = create_engine(DB_URL)
+CACHED_MODEL_NAME = None
+
+# --- FUNÇÕES DE BANCO DE DADOS ---
+def ensure_schema():
+    print("🔧 Schema check (V22 - Raio-X Pro)...")
+    with engine.begin() as conn:
+        try:
+            conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS price DECIMAL(18, 2) DEFAULT 0;"))
+            conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS pe_ratio DECIMAL(10, 2) DEFAULT 0;"))
+            conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS dy_percentage DECIMAL(10, 2) DEFAULT 0;"))
+            conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS ai_analysis TEXT;"))
+            conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS full_report TEXT;"))
+            conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS news_summary TEXT;"))
+            conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP;"))
+        except Exception as e:
+            print(f"⚠️ Aviso schema: {e}")
+
+# --- FUNÇÕES GEMINI (IA DE ANÁLISE) ---
+def get_valid_model():
+    global CACHED_MODEL_NAME
+    if CACHED_MODEL_NAME: return CACHED_MODEL_NAME
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_KEY}"
+    try:
+        data = requests.get(url, timeout=10).json()
+        if 'models' not in data: return "gemini-1.5-flash"
+        for m in data['models']:
+            name = m['name'].replace("models/", "")
+            if "gemini" in name and "generateContent" in m.get('supportedGenerationMethods', []):
+                CACHED_MODEL_NAME = name
+                return name
+        return "gemini-1.5-flash"
+    except: return "gemini-1.5-flash"
+
+def get_ai_analysis(ticker, info):
+    if not GEMINI_KEY: return ("Chave vazia", "Sem detalhes", 500)
+
+    model_name = get_valid_model()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_KEY}"
     
-    /* Novo Estilo de Notícias */
-    .news-text { font-size: 0.85rem; color: #333; line-height: 1.3; margin-bottom: 4px; display: block; }
-    .source-badge { 
-        font-size: 0.7rem; 
-        background-color: #f8f9fa; 
-        color: #0d6efd; 
-        border: 1px solid #dee2e6; 
-        padding: 1px 6px; 
-        border-radius: 4px; 
-        text-decoration: none; 
-        margin-right: 4px;
-        transition: all 0.2s;
-    }
-    .source-badge:hover { background-color: #0d6efd; color: white; border-color: #0d6efd; }
-</style>
+    # Dados para o Prompt
+    pl = info.get('trailingPE', 'N/A')
+    roe = info.get('returnOnEquity', 0)
+    roe_fmt = f"{roe*100:.2f}%" if isinstance(roe, (int, float)) else "N/A"
+    
+    high52 = info.get('fiftyTwoWeekHigh', 0)
+    low52 = info.get('fiftyTwoWeekLow', 0)
+    current = info.get('currentPrice', 0)
+    date_now = datetime.now().strftime("%d/%m/%Y")
+    
+    # Lógica de Tendência Simples
+    tendencia = "Lateral"
+    if current > high52 * 0.9: tendencia = "Alta Forte"
+    elif current < low52 * 1.1: tendencia = "Baixa Forte"
+    
+    # PROMPT PADRONIZADO "RAIO-X"
+    prompt = f"""
+    Aja como um Analista Sênior da B3. Gere um relatório para {ticker} seguindo ESTRITAMENTE o modelo abaixo.
+    Não mude os títulos das seções.
 
-<div class="container py-4">
-    <div class="d-flex justify-content-between align-items-center mb-4">
-        <div>
-            <h3 class="fw-bold mb-0">🚀 Smart Trader AI</h3>
-            <span class="text-muted small">Monitoramento em Tempo Real</span>
-        </div>
-        <span class="badge bg-success bg-opacity-10 text-success border border-success px-3 py-2 rounded-pill">
-            ● Sistema Online
-        </span>
-    </div>
+    Dados Base:
+    - Preço: R$ {current}
+    - P/L: {pl}
+    - ROE: {roe_fmt}
+    - Tendência Técnica: {tendencia}
+    - Data: {date_now}
 
-    <div class="input-group mb-4 shadow-sm">
-        <input type="text" @bind="tickerInput" class="form-control border-0 py-3" placeholder="Digite o ativo (ex: WEGE3)..." @onkeyup="HandleKey" />
-        <button class="btn btn-primary px-4 fw-bold" @onclick="AddFavorite">MONITORAR</button>
-    </div>
+    MODELO DE RESPOSTA (JSON campo "full_report"):
+    
+    ## Análise do Ativo: {ticker}
+    **Analista B3** | Data: {date_now} | Preço: R$ {current}
 
-    @if (isLoading)
-    {
-        <div class="text-center py-5"><div class="spinner-border text-primary"></div></div>
-    }
-    else if (assets != null && assets.Any())
-    {
-        <div class="card shadow-sm border-0 rounded-3 overflow-hidden">
-            <table class="table table-hover mb-0 align-middle">
-                <thead class="bg-light border-bottom">
-                    <tr>
-                        <th class="ps-4 text-secondary text-uppercase small fw-bold py-3">Ativo</th>
-                        <th class="text-secondary text-uppercase small fw-bold">Preço</th>
-                        <th class="text-secondary text-uppercase small fw-bold" style="width: 35%;">Status IA</th>
-                        <th class="text-secondary text-uppercase small fw-bold" style="width: 35%;">Resumo de Notícias</th>
-                        <th class="text-end pe-4"></th>
-                    </tr>
-                </thead>
-                <tbody>
-                    @foreach (var item in assets)
-                    {
-                        <tr>
-                            <td class="ps-4">
-                                <div class="ticker-tag">@item.Ticker</div>
-                                <div class="small text-muted" style="font-size: 0.75rem;">B3</div>
-                            </td>
-                            <td>
-                                <div class="price-tag">R$ @(item.Price.ToString("N2"))</div>
-                                <div class="small text-muted">P/L @(item.PeRatio.ToString("N2"))</div>
-                            </td>
-                            
-                            <td class="py-3 pe-3">
-                                @((MarkupString)RenderSmartStatus(item.AiAnalysis))
-                                <button class="btn btn-link btn-sm p-0 text-decoration-none fw-bold text-primary d-block mt-1" 
-                                        style="font-size: 0.75rem;" @onclick="() => OpenModal(item)">
-                                    Ler Relatório Completo →
-                                </button>
-                            </td>
+    ### 1. Visão Geral
+    [Escreva 1 parágrafo introdutório sobre a empresa e o momento atual dela na bolsa].
 
-                            <td class="py-3 pe-3">
-                                @((MarkupString)RenderNewsWithSources(item.NewsSummary))
-                            </td>
+    ### 2. Análise Fundamentalista
+    * **P/L (Preço/Lucro): {pl}**
+    [Explique se está barato ou caro comparado ao histórico e setor].
+    
+    * **ROE (Retorno sobre o Patrimônio): {roe_fmt}**
+    [Explique a eficiência da empresa em gerar lucro].
 
-                            <td class="text-end pe-4">
-                                <button class="btn btn-sm btn-light text-danger border-0" @onclick="() => Remove(item.Ticker)">✕</button>
-                            </td>
-                        </tr>
-                    }
-                </tbody>
-            </table>
-        </div>
-    }
-</div>
+    ### 3. Análise Técnica
+    * **Tendência:** {tendencia}
+    [Explique o momentum de preço e pressão compradora/vendedora].
 
-@if (selectedAsset != null)
-{
-    <div class="modal fade show" style="display: block; background: rgba(0,0,0,0.6); backdrop-filter: blur(2px);" tabindex="-1">
-        <div class="modal-dialog modal-lg modal-dialog-centered">
-            <div class="modal-content border-0 shadow-lg">
-                <div class="modal-header bg-light border-bottom-0 pb-0">
-                    <h5 class="modal-title fw-bold text-dark">📊 Raio-X: @selectedAsset.Ticker</h5>
-                    <button type="button" class="btn-close" @onclick="CloseModal"></button>
-                </div>
-                <div class="modal-body pt-2">
-                    <div class="p-3 bg-white rounded">
-                         <div style="white-space: pre-wrap; font-family: 'Segoe UI', sans-serif; line-height: 1.7; color: #333;">
-                            @((MarkupString)FormatFullReport(selectedAsset.FullReport))
-                        </div>
-                    </div>
-                </div>
-                <div class="modal-footer border-top-0 pt-0">
-                    <button type="button" class="btn btn-dark px-4" @onclick="CloseModal">Fechar</button>
-                </div>
-            </div>
-        </div>
-    </div>
-}
+    ### 4. Conclusão e Perspectivas
+    [Veredito final unindo os fundamentos e o técnico. Cite riscos e oportunidades].
 
-@code {
-    private string tickerInput = "";
-    private List<AssetDto>? assets;
-    private AssetDto? selectedAsset;
-    private bool isLoading = true;
-    private string? errorMessage;
-
-    protected override async Task OnInitializedAsync()
-    {
-        await LoadData();
-    }
-    private async Task LoadData() { isLoading = true; try { assets = await Http.GetFromJsonAsync<List<AssetDto>>("api/favorites"); } catch (Exception ex) { errorMessage = ex.Message; } finally { isLoading = false; } }
-    private async Task AddFavorite() { if (string.IsNullOrWhiteSpace(tickerInput)) return; await Http.PostAsync($"api/favorites/{tickerInput}", null); tickerInput = ""; await LoadData(); }
-    private async Task Remove(string ticker) { await Http.DeleteAsync($"api/favorites/{ticker}"); await LoadData(); }
-    private async Task HandleKey(KeyboardEventArgs e) { if (e.Key == "Enter") await AddFavorite(); }
-    private void OpenModal(AssetDto asset) => selectedAsset = asset;
-    private void CloseModal() => selectedAsset = null;
-
-    // --- RENDERIZADORES ---
-
-    private string RenderSmartStatus(string text)
-    {
-        if (string.IsNullOrEmpty(text)) return "<span class='text-muted'>Analisando...</span>";
-        if (text.Contains("429") || text.Contains("Cota")) return "<span class='text-warning fw-bold'>⚠️ Aguardando Google</span>";
-        if (text.Contains("Erro")) return $"<span class='text-danger fw-bold'>{text}</span>";
-
-        string headerHtml = "<span class='status-header text-dark'>⚖️ ANÁLISE.</span>";
-        if (Regex.IsMatch(text, @"\b(compra|oportunidade|atrativo|upside)\b", RegexOptions.IgnoreCase)) headerHtml = "<span class='status-header text-success'>🚀 ALERTA DE COMPRA.</span>";
-        else if (Regex.IsMatch(text, @"\b(cautela|risco|neutro|atenção)\b", RegexOptions.IgnoreCase)) headerHtml = "<span class='status-header text-warning' style='color:#fd7e14!important'>✋ NEUTRO.</span>";
-        else if (Regex.IsMatch(text, @"\b(venda|negativo|queda|fraco)\b", RegexOptions.IgnoreCase)) headerHtml = "<span class='status-header text-danger'>🔻 FRACO.</span>";
-
-        return $"{headerHtml} <span class='status-body'>{text}</span>";
-    }
-
-    // A MÁGICA DAS NOTÍCIAS: TEXTO + FONTES
-    private string RenderNewsWithSources(string fullText)
-    {
-        if (string.IsNullOrEmpty(fullText)) return "-";
+    ---
+    JSON Output rules:
+    1. "summary": Frase curta de impacto para a tabela (max 30 palavras). Use termos como "Oportunidade", "Cautela", "Compra".
+    2. "full_report": O texto completo acima formatado com Markdown.
+    """
+    
+    headers = {'Content-Type': 'application/json'}
+    data = {"contents": [{"parts": [{"text": prompt}]}]}
+    
+    try:
+        response = requests.post(url, headers=headers, json=data, timeout=30)
         
-        // Separa o Texto dos Links usando nossa "flag" do backend
-        var parts = fullText.Split(new[] { "__FONTES__" }, StringSplitOptions.None);
+        if response.status_code == 200:
+            text_resp = response.json()['candidates'][0]['content']['parts'][0]['text']
+            text_resp = text_resp.replace("```json", "").replace("```", "").strip()
+            try:
+                json_data = json.loads(text_resp)
+                return (json_data.get("summary", "Erro resumo"), json_data.get("full_report", "Erro detalhe"), 200)
+            except:
+                return ("Erro JSON", text_resp, 200)
+        elif response.status_code == 429:
+            return ("⚠️ Cota Google Excedida", "Aguarde restabelecimento.", 429)
+        else:
+            return (f"Erro Google {response.status_code}", "", response.status_code)
+            
+    except Exception as e:
+        return (f"Erro Req: {str(e)[:15]}", "", 500)
+
+# --- FUNÇÃO PERPLEXITY (NOTÍCIAS FLASH) ---
+def get_news_from_perplexity(ticker):
+    if not PERPLEXITY_KEY: return "Sem chave News"
+    
+    url = "https://api.perplexity.ai/chat/completions"
+    
+    prompt = f"""
+    Atue como um jornalista financeiro de Flash News.
+    Resuma as notícias mais recentes sobre {ticker} em UMA frase objetiva e factual (máximo 30 palavras).
+    Não use introduções como "A notícia é...". Vá direto ao ponto (Ex: "Lucro líquido sobe 10% impulsionado por...").
+    """
+    
+    payload = {
+        "model": "sonar", 
+        "messages": [{"role": "user", "content": prompt}]
+    }
+    headers = {"Authorization": f"Bearer {PERPLEXITY_KEY}", "Content-Type": "application/json"}
+    
+    try:
+        res = requests.post(url, json=payload, headers=headers).json()
         
-        string newsBody = parts[0].Replace("[", "").Replace("]", ""); // Limpa marcadores do texto
-        string linksHtml = "";
+        if 'choices' in res:
+            content = res['choices'][0]['message']['content']
+            citations = res.get('citations', [])
+            
+            if citations:
+                formatted_text = content + "\n\n__FONTES__"
+                for i, link in enumerate(citations):
+                    formatted_text += f"\n[{i+1}] {link}"
+                return formatted_text
+            
+            return content
+            
+        return "Sem notícias recentes."
+    except Exception as e:
+        return f"Erro News: {str(e)[:20]}"
 
-        if (parts.Length > 1)
-        {
-            // Extrai links da segunda parte
-            var matches = Regex.Matches(parts[1], @"(\[\d+\])\s*(https?://[^\s]+)");
-            foreach (Match m in matches)
-            {
-                linksHtml += $"<a href='{m.Groups[2].Value}' target='_blank' class='source-badge' title='Abrir Fonte'>{m.Groups[1].Value}</a>";
-            }
-        }
-        else 
-        {
-            // Fallback para versões antigas sem __FONTES__
-             var matches = Regex.Matches(fullText, @"(\[\d+\])\s*(https?://[^\s]+)");
-             if (matches.Count > 0) {
-                 newsBody = "Notícia disponível nas fontes.";
-                 foreach (Match m in matches) linksHtml += $"<a href='{m.Groups[2].Value}' target='_blank' class='source-badge'>{m.Groups[1].Value}</a>";
-             }
-        }
+def fix_ticker(ticker):
+    ticker = ticker.upper().strip()
+    if not ticker.endswith(".SA") and len(ticker) <= 6: return ticker + ".SA"
+    return ticker
 
-        if (string.IsNullOrEmpty(linksHtml)) linksHtml = "<span class='text-muted small ms-1'>s/ fontes</span>";
+# --- LOOP PRINCIPAL ---
+def run_market_update():
+    print(f"\n--- 🚀 V22 (Raio-X Pro): {datetime.now()} ---")
+    try:
+        with engine.connect() as conn:
+            assets = conn.execute(text("SELECT id, ticker, ai_analysis, last_update FROM assets")).fetchall()
+    except Exception as e:
+        print(f"❌ Erro Banco: {e}")
+        return
 
-        return $@"
-            <span class='news-text'>{newsBody}</span>
-            <div class='mt-1'>{linksHtml}</div>
-        ";
-    }
+    google_blocked = False
 
-    private string FormatFullReport(string text) => Regex.Replace(text ?? "...", @"\*\*(.*?)\*\*", "<b>$1</b>");
+    for asset in assets:
+        real_ticker = fix_ticker(asset.ticker)
+        print(f"🔄 {real_ticker}...", end=" ")
+        
+        try:
+            # 1. PREÇO
+            t = yf.Ticker(real_ticker)
+            info = t.info
+            current_price = info.get('currentPrice') or info.get('regularMarketPrice')
+            
+            if not current_price:
+                print("⚠️ Sem preço.")
+                continue
 
-    public class AssetDto
-    {
-        public string Ticker { get; set; } = "";
-        public decimal Price { get; set; }
-        public decimal PeRatio { get; set; }
-        public decimal DyPercentage { get; set; }
-        public string AiAnalysis { get; set; } = "";
-        public string FullReport { get; set; } = "";
-        public string NewsSummary { get; set; } = "";
-    }
-}
+            # 2. NOTÍCIAS
+            news = get_news_from_perplexity(real_ticker)
+            
+            # BLINDAGEM: Salva preço e news antes da IA
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    UPDATE assets SET 
+                    price = :pr, pe_ratio = :pe, dy_percentage = :dy, news_summary = :news, last_update = CURRENT_TIMESTAMP
+                    WHERE id = :aid
+                """), {
+                    "pr": current_price,
+                    "pe": info.get('trailingPE', 0),
+                    "dy": (info.get('dividendYield', 0) or 0) * 100,
+                    "news": news,
+                    "aid": asset.id
+                })
+            
+            print(f"💰 Dados salvos.", end=" ")
+
+            # 3. SMART SKIP (Economia de Cota)
+            if google_blocked:
+                print("⏭️ 429 Ativo. Skip IA.")
+                continue
+
+            last_up = asset.last_update
+            current_ai = asset.ai_analysis or ""
+            is_recent = last_up and (datetime.now() - last_up).total_seconds() < 14400
+            has_valid_ai = "Erro" not in current_ai and "Cota" not in current_ai and len(current_ai) > 10
+
+            if is_recent and has_valid_ai:
+                print("✅ IA recente. Skip.")
+                continue
+
+            # 4. EXECUTA IA
+            summary, full_report, status_code = get_ai_analysis(real_ticker, info)
+            
+            if status_code == 429:
+                print("🛑 429 Detectado! Parando IAs.")
+                google_blocked = True
+                with engine.begin() as conn:
+                    conn.execute(text("UPDATE assets SET ai_analysis = :ana WHERE id = :aid"), 
+                                {"ana": "⚠️ Cota Excedida (Aguardando)", "aid": asset.id})
+            else:
+                with engine.begin() as conn:
+                    conn.execute(text("UPDATE assets SET ai_analysis = :ana, full_report = :full WHERE id = :aid"), 
+                                {"ana": summary, "full": full_report, "aid": asset.id})
+                print("✅ IA OK.")
+                time.sleep(15) 
+
+        except Exception as e:
+            print(f"❌ Erro: {e}")
+
+if __name__ == "__main__":
+    ensure_schema()
+    run_market_update()
+    schedule.every(6).hours.do(run_market_update)
+    while True:
+        schedule.run_pending()
+        time.sleep(60)

@@ -23,7 +23,7 @@ CACHED_MODEL_NAME = None
 
 # --- FUNÇÕES DE BANCO DE DADOS ---
 def ensure_schema():
-    print("🔧 Schema check (V21 - News Pro)...")
+    print("🔧 Schema check (V22 - Raio-X Pro)...")
     with engine.begin() as conn:
         try:
             conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS price DECIMAL(18, 2) DEFAULT 0;"))
@@ -61,21 +61,56 @@ def get_ai_analysis(ticker, info):
     # Dados para o Prompt
     pl = info.get('trailingPE', 'N/A')
     roe = info.get('returnOnEquity', 0)
+    roe_fmt = f"{roe*100:.2f}%" if isinstance(roe, (int, float)) else "N/A"
+    
     high52 = info.get('fiftyTwoWeekHigh', 0)
     low52 = info.get('fiftyTwoWeekLow', 0)
     current = info.get('currentPrice', 0)
+    date_now = datetime.now().strftime("%d/%m/%Y")
     
+    # Lógica de Tendência Simples
     tendencia = "Lateral"
     if current > high52 * 0.9: tendencia = "Alta Forte"
-    elif current < low52 * 1.1: tendencia = "Baixa"
+    elif current < low52 * 1.1: tendencia = "Baixa Forte"
     
+    # PROMPT PADRONIZADO "RAIO-X"
     prompt = f"""
-    Analista B3 Sênior. Ativo: {ticker}. 
-    Dados: Preço: {current} | P/L: {pl} | ROE: {roe} | Tendência: {tendencia}.
+    Aja como um Analista Sênior da B3. Gere um relatório para {ticker} seguindo ESTRITAMENTE o modelo abaixo.
+    Não mude os títulos das seções.
+
+    Dados Base:
+    - Preço: R$ {current}
+    - P/L: {pl}
+    - ROE: {roe_fmt}
+    - Tendência Técnica: {tendencia}
+    - Data: {date_now}
+
+    MODELO DE RESPOSTA (JSON campo "full_report"):
     
-    Gere um JSON puro com dois campos:
-    1. "summary": Uma frase estratégica sobre o valuation e momento (max 40 palavras). Use termos como "Oportunidade", "Cautela", "Compra" se aplicável.
-    2. "full_report": Relatório completo com quebras de linha, Análise Fundamentalista, Técnica e Veredito.
+    ## Análise do Ativo: {ticker}
+    **Analista B3** | Data: {date_now} | Preço: R$ {current}
+
+    ### 1. Visão Geral
+    [Escreva 1 parágrafo introdutório sobre a empresa e o momento atual dela na bolsa].
+
+    ### 2. Análise Fundamentalista
+    * **P/L (Preço/Lucro): {pl}**
+    [Explique se está barato ou caro comparado ao histórico e setor].
+    
+    * **ROE (Retorno sobre o Patrimônio): {roe_fmt}**
+    [Explique a eficiência da empresa em gerar lucro].
+
+    ### 3. Análise Técnica
+    * **Tendência:** {tendencia}
+    [Explique o momentum de preço e pressão compradora/vendedora].
+
+    ### 4. Conclusão e Perspectivas
+    [Veredito final unindo os fundamentos e o técnico. Cite riscos e oportunidades].
+
+    ---
+    JSON Output rules:
+    1. "summary": Frase curta de impacto para a tabela (max 30 palavras). Use termos como "Oportunidade", "Cautela", "Compra".
+    2. "full_report": O texto completo acima formatado com Markdown.
     """
     
     headers = {'Content-Type': 'application/json'}
@@ -100,13 +135,12 @@ def get_ai_analysis(ticker, info):
     except Exception as e:
         return (f"Erro Req: {str(e)[:15]}", "", 500)
 
-# --- FUNÇÃO PERPLEXITY (NOTÍCIAS JORNALÍSTICAS) ---
+# --- FUNÇÃO PERPLEXITY (NOTÍCIAS FLASH) ---
 def get_news_from_perplexity(ticker):
     if not PERPLEXITY_KEY: return "Sem chave News"
     
     url = "https://api.perplexity.ai/chat/completions"
     
-    # Prompt ajustado para Resumo Jornalístico (Flash News)
     prompt = f"""
     Atue como um jornalista financeiro de Flash News.
     Resuma as notícias mais recentes sobre {ticker} em UMA frase objetiva e factual (máximo 30 palavras).
@@ -126,9 +160,8 @@ def get_news_from_perplexity(ticker):
             content = res['choices'][0]['message']['content']
             citations = res.get('citations', [])
             
-            # Formatação Especial: Texto + Separador + Links
             if citations:
-                formatted_text = content + "\n\n__FONTES__" # Separador para o Frontend
+                formatted_text = content + "\n\n__FONTES__"
                 for i, link in enumerate(citations):
                     formatted_text += f"\n[{i+1}] {link}"
                 return formatted_text
@@ -146,7 +179,7 @@ def fix_ticker(ticker):
 
 # --- LOOP PRINCIPAL ---
 def run_market_update():
-    print(f"\n--- 🚀 V21 (News Pro + Blindagem): {datetime.now()} ---")
+    print(f"\n--- 🚀 V22 (Raio-X Pro): {datetime.now()} ---")
     try:
         with engine.connect() as conn:
             assets = conn.execute(text("SELECT id, ticker, ai_analysis, last_update FROM assets")).fetchall()
@@ -161,7 +194,7 @@ def run_market_update():
         print(f"🔄 {real_ticker}...", end=" ")
         
         try:
-            # 1. PREÇO (YFinance)
+            # 1. PREÇO
             t = yf.Ticker(real_ticker)
             info = t.info
             current_price = info.get('currentPrice') or info.get('regularMarketPrice')
@@ -170,11 +203,10 @@ def run_market_update():
                 print("⚠️ Sem preço.")
                 continue
 
-            # 2. NOTÍCIAS (Perplexity Jornalista)
+            # 2. NOTÍCIAS
             news = get_news_from_perplexity(real_ticker)
             
-            # SALVAMENTO IMEDIATO (Blindagem)
-            # Garante que Preço e Notícias apareçam mesmo se a IA falhar
+            # BLINDAGEM: Salva preço e news antes da IA
             with engine.begin() as conn:
                 conn.execute(text("""
                     UPDATE assets SET 
@@ -190,12 +222,11 @@ def run_market_update():
             
             print(f"💰 Dados salvos.", end=" ")
 
-            # 3. VERIFICAÇÃO DE COTA (Smart Skip)
+            # 3. SMART SKIP (Economia de Cota)
             if google_blocked:
                 print("⏭️ 429 Ativo. Skip IA.")
                 continue
 
-            # Se IA foi atualizada há menos de 4h e é válida, pula
             last_up = asset.last_update
             current_ai = asset.ai_analysis or ""
             is_recent = last_up and (datetime.now() - last_up).total_seconds() < 14400
@@ -205,11 +236,11 @@ def run_market_update():
                 print("✅ IA recente. Skip.")
                 continue
 
-            # 4. TENTA EXECUTAR A IA
+            # 4. EXECUTA IA
             summary, full_report, status_code = get_ai_analysis(real_ticker, info)
             
             if status_code == 429:
-                print("🛑 429 Detectado! Parando IAs por este ciclo.")
+                print("🛑 429 Detectado! Parando IAs.")
                 google_blocked = True
                 with engine.begin() as conn:
                     conn.execute(text("UPDATE assets SET ai_analysis = :ana WHERE id = :aid"), 
@@ -219,7 +250,7 @@ def run_market_update():
                     conn.execute(text("UPDATE assets SET ai_analysis = :ana, full_report = :full WHERE id = :aid"), 
                                 {"ana": summary, "full": full_report, "aid": asset.id})
                 print("✅ IA OK.")
-                time.sleep(15) # Pausa de segurança
+                time.sleep(15) 
 
         except Exception as e:
             print(f"❌ Erro: {e}")
