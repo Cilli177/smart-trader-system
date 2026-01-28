@@ -35,58 +35,72 @@ def ensure_schema():
 def get_ai_analysis(ticker, info):
     if not GEMINI_KEY: return "Chave Gemini vazia."
 
-    # --- 1. COLETA DE DADOS PROFUNDA ---
-    # Pegamos mais indicadores para a IA ter "cérebro"
+    # --- 1. DADOS FUNDAMENTALISTAS ---
     pl = info.get('trailingPE', 'N/A')
     p_vp = info.get('priceToBook', 'N/A')
     roe = info.get('returnOnEquity', 0)
     margem = info.get('profitMargins', 0)
     div_yield = (info.get('dividendYield', 0) or 0) * 100
 
-    # Formata porcentagens para facilitar leitura da IA
+    # Formatação
     roe_fmt = f"{roe*100:.1f}%" if isinstance(roe, (int, float)) else "N/A"
     margem_fmt = f"{margem*100:.1f}%" if isinstance(margem, (int, float)) else "N/A"
     dy_fmt = f"{div_yield:.1f}%"
 
-    # --- 2. PROMPT "ANALISTA SÊNIOR" ---
-    # Instrução para ser técnico, direto e opinativo
+    # --- 2. PROMPT AVANÇADO (V10) ---
     prompt = f"""
     Aja como um analista Sênior de Value Investing focado na B3.
-    Analise o ativo {ticker} com estes fundamentos:
+    Analise o ativo {ticker}:
     - Preço: R$ {info.get('currentPrice')}
-    - P/L: {pl} (Média histórica do setor ~10)
+    - P/L: {pl} (Setor ~10)
     - P/VP: {p_vp}
-    - ROE: {roe_fmt} (Rentabilidade)
+    - ROE: {roe_fmt}
     - Margem Líquida: {margem_fmt}
     - Dividend Yield: {dy_fmt}
 
-    Escreva uma análise estratégica de 1 parágrafo (max 40 palavras).
-    Não descreva os números, INTERPRETE-OS.
-    Diga se a ação está descontada (barata), justa ou cara, e se a qualidade (ROE/Margem) justifica o preço.
-    Termine com um veredito implícito (Oportunidade, Cautela ou Risco).
+    Em 1 parágrafo DENSO (max 35 palavras):
+    Interprete se o ativo está barato (P/L, P/VP) e se tem qualidade (ROE, Margem).
+    Cite explicitamente os indicadores chave. Dê um veredito de risco ou oportunidade.
     """
 
-    # Usamos o modelo 'gemini-pro' (v1 estável) que funcionou bem
-    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent?key={GEMINI_KEY}"
-    headers = {'Content-Type': 'application/json'}
-    data = {"contents": [{"parts": [{"text": prompt}]}]}
+    # --- 3. ESTRATÉGIA DE REDUNDÂNCIA (V7) ---
+    # Tenta vários modelos. Se um der 404, pula para o próximo.
+    attempts = [
+        ("gemini-1.5-flash", "v1beta"),
+        ("gemini-1.5-pro", "v1beta"),
+        ("gemini-1.5-flash-latest", "v1beta"),
+        ("gemini-pro", "v1")
+    ]
     
-    try:
-        response = requests.post(url, headers=headers, json=data, timeout=20)
-        if response.status_code == 200:
-            return response.json()['candidates'][0]['content']['parts'][0]['text']
-        else:
-            return f"Erro Google {response.status_code}"
-    except Exception as e:
-        return f"Erro Conexão: {str(e)[:20]}"
+    last_error = ""
+
+    for model, version in attempts:
+        url = f"https://generativelanguage.googleapis.com/{version}/models/{model}:generateContent?key={GEMINI_KEY}"
+        headers = {'Content-Type': 'application/json'}
+        data = {"contents": [{"parts": [{"text": prompt}]}]}
+        
+        try:
+            response = requests.post(url, headers=headers, json=data, timeout=15)
+            
+            if response.status_code == 200:
+                # SUCESSO!
+                return response.json()['candidates'][0]['content']['parts'][0]['text']
+            else:
+                last_error = f"{model} ({response.status_code})"
+                continue # Tenta o próximo
+                
+        except Exception as e:
+            last_error = str(e)
+
+    return f"FALHA IA: {last_error}"
 
 def get_news_from_perplexity(ticker):
-    # Mantido igual (está ótimo)
+    # Notícias estão ótimas, mantemos igual
     if not PERPLEXITY_KEY: return "Chave News vazia."
     url = "https://api.perplexity.ai/chat/completions"
     payload = {
         "model": "sonar", 
-        "messages": [{"role": "user", "content": f"Manchete mais impactante de {ticker} hoje para investidores (max 15 palavras)."}]
+        "messages": [{"role": "user", "content": f"Manchete financeira mais importante sobre {ticker} hoje (max 20 palavras)."}]
     }
     headers = {"Authorization": f"Bearer {PERPLEXITY_KEY}", "Content-Type": "application/json"}
     try:
@@ -102,7 +116,7 @@ def fix_ticker(ticker):
     return ticker
 
 def run_market_update():
-    print(f"\n--- 🚀 Inteligência V10 (Deep Analysis): {datetime.now()} ---")
+    print(f"\n--- 🚀 Inteligência V11 (Híbrida): {datetime.now()} ---")
     
     try:
         with engine.connect() as conn:
@@ -142,7 +156,7 @@ def run_market_update():
                     "news": news,
                     "aid": asset.id
                 })
-            print(f"✅ R$ {current_price} | IA Gerada")
+            print(f"✅ R$ {current_price} | IA: {analysis[:15]}...")
             
         except Exception as e:
             print(f"❌ Erro: {e}")
