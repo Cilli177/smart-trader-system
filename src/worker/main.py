@@ -19,6 +19,9 @@ if not DB_URL:
 
 engine = create_engine(DB_URL)
 
+# Variável Global para Cache do Modelo
+FOUND_MODEL = None
+
 def ensure_schema():
     print("🔧 Schema check...")
     with engine.begin() as conn:
@@ -32,75 +35,81 @@ def ensure_schema():
         except Exception as e:
             print(f"⚠️ Aviso schema: {e}")
 
+def find_working_model():
+    """DIAGNÓSTICO: Pergunta ao Google quais modelos a chave pode usar"""
+    global FOUND_MODEL
+    if FOUND_MODEL: return FOUND_MODEL
+
+    # Tenta listar modelos na versão v1beta (mais abrangente)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_KEY}"
+    
+    try:
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        
+        if 'error' in data:
+            return f"ERRO API: {data['error']['message']}"
+            
+        if 'models' not in data:
+            return "LISTA VAZIA (Sua chave não vê modelos)"
+
+        # Procura o primeiro modelo que gera texto
+        available_models = []
+        for m in data['models']:
+            name = m['name'].replace("models/", "")
+            available_models.append(name)
+            if 'generateContent' in m.get('supportedGenerationMethods', []):
+                print(f"✅ Modelo Válido Encontrado: {name}")
+                FOUND_MODEL = name # Salva para não buscar de novo
+                return name
+        
+        return f"SEM MODELOS TEXTO. Disponíveis: {', '.join(available_models[:3])}"
+
+    except Exception as e:
+        return f"ERRO CONEXÃO: {str(e)}"
+
 def get_ai_analysis(ticker, info):
     if not GEMINI_KEY: return "Chave Gemini vazia."
 
-    # --- 1. DADOS FUNDAMENTALISTAS ---
-    pl = info.get('trailingPE', 'N/A')
-    p_vp = info.get('priceToBook', 'N/A')
-    roe = info.get('returnOnEquity', 0)
-    margem = info.get('profitMargins', 0)
-    div_yield = (info.get('dividendYield', 0) or 0) * 100
-
-    # Formatação
-    roe_fmt = f"{roe*100:.1f}%" if isinstance(roe, (int, float)) else "N/A"
-    margem_fmt = f"{margem*100:.1f}%" if isinstance(margem, (int, float)) else "N/A"
-    dy_fmt = f"{div_yield:.1f}%"
-
-    # --- 2. PROMPT AVANÇADO (V10) ---
-    prompt = f"""
-    Aja como um analista Sênior de Value Investing focado na B3.
-    Analise o ativo {ticker}:
-    - Preço: R$ {info.get('currentPrice')}
-    - P/L: {pl} (Setor ~10)
-    - P/VP: {p_vp}
-    - ROE: {roe_fmt}
-    - Margem Líquida: {margem_fmt}
-    - Dividend Yield: {dy_fmt}
-
-    Em 1 parágrafo DENSO (max 35 palavras):
-    Interprete se o ativo está barato (P/L, P/VP) e se tem qualidade (ROE, Margem).
-    Cite explicitamente os indicadores chave. Dê um veredito de risco ou oportunidade.
-    """
-
-    # --- 3. ESTRATÉGIA DE REDUNDÂNCIA (V7) ---
-    # Tenta vários modelos. Se um der 404, pula para o próximo.
-    attempts = [
-        ("gemini-1.5-flash", "v1beta"),
-        ("gemini-1.5-pro", "v1beta"),
-        ("gemini-1.5-flash-latest", "v1beta"),
-        ("gemini-pro", "v1")
-    ]
+    # 1. Descobre qual modelo usar (ou o erro)
+    model_name_or_error = find_working_model()
     
-    last_error = ""
+    # Se o retorno parecer um erro (tem espaços ou é longo), exibe na tela
+    if " " in model_name_or_error and "gemini" not in model_name_or_error:
+        return f"DIAGNÓSTICO: {model_name_or_error}"
 
-    for model, version in attempts:
-        url = f"https://generativelanguage.googleapis.com/{version}/models/{model}:generateContent?key={GEMINI_KEY}"
-        headers = {'Content-Type': 'application/json'}
-        data = {"contents": [{"parts": [{"text": prompt}]}]}
-        
-        try:
-            response = requests.post(url, headers=headers, json=data, timeout=15)
-            
-            if response.status_code == 200:
-                # SUCESSO!
-                return response.json()['candidates'][0]['content']['parts'][0]['text']
-            else:
-                last_error = f"{model} ({response.status_code})"
-                continue # Tenta o próximo
-                
-        except Exception as e:
-            last_error = str(e)
-
-    return f"FALHA IA: {last_error}"
+    # 2. Usa o modelo descoberto
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name_or_error}:generateContent?key={GEMINI_KEY}"
+    
+    # Prompt V10 (Deep Analysis)
+    prompt = f"""
+    Analista B3 Sênior. Ativo: {ticker}.
+    Preço: R$ {info.get('currentPrice')}. P/L: {info.get('trailingPE', 'N/A')}.
+    ROE: {info.get('returnOnEquity', 0)}.
+    
+    Em 1 parágrafo técnico (max 35 palavras):
+    O valuation (P/L) e a qualidade (ROE) indicam compra ou cautela?
+    """
+    
+    headers = {'Content-Type': 'application/json'}
+    data = {"contents": [{"parts": [{"text": prompt}]}]}
+    
+    try:
+        response = requests.post(url, headers=headers, json=data, timeout=15)
+        if response.status_code == 200:
+            return response.json()['candidates'][0]['content']['parts'][0]['text']
+        else:
+            return f"Erro {response.status_code} no modelo {model_name_or_error}"
+    except Exception as e:
+        return f"Erro Req: {str(e)[:20]}"
 
 def get_news_from_perplexity(ticker):
-    # Notícias estão ótimas, mantemos igual
+    # Notícias estão funcionando, mantemos.
     if not PERPLEXITY_KEY: return "Chave News vazia."
     url = "https://api.perplexity.ai/chat/completions"
     payload = {
         "model": "sonar", 
-        "messages": [{"role": "user", "content": f"Manchete financeira mais importante sobre {ticker} hoje (max 20 palavras)."}]
+        "messages": [{"role": "user", "content": f"Manchete financeira importante de {ticker} hoje (max 20 palavras)."}]
     }
     headers = {"Authorization": f"Bearer {PERPLEXITY_KEY}", "Content-Type": "application/json"}
     try:
@@ -116,7 +125,7 @@ def fix_ticker(ticker):
     return ticker
 
 def run_market_update():
-    print(f"\n--- 🚀 Inteligência V11 (Híbrida): {datetime.now()} ---")
+    print(f"\n--- 🚀 Inteligência V12 (Diagnóstico): {datetime.now()} ---")
     
     try:
         with engine.connect() as conn:
@@ -156,7 +165,7 @@ def run_market_update():
                     "news": news,
                     "aid": asset.id
                 })
-            print(f"✅ R$ {current_price} | IA: {analysis[:15]}...")
+            print(f"✅ R$ {current_price} | Resposta: {analysis[:20]}...")
             
         except Exception as e:
             print(f"❌ Erro: {e}")
