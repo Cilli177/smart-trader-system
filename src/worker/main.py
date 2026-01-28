@@ -3,7 +3,6 @@ import time
 import schedule
 import yfinance as yf
 import requests
-import json
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 from datetime import datetime
@@ -11,8 +10,11 @@ from datetime import datetime
 # Carrega variáveis
 load_dotenv()
 DB_URL = os.getenv("DATABASE_URL")
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-PERPLEXITY_KEY = os.getenv("PERPLEXITY_API_KEY")
+
+# --- LIMPEZA DE CHAVES (CRÍTICO) ---
+# Remove aspas e espaços que podem ter vindo no copy-paste
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").replace('"', '').replace("'", "").strip()
+PERPLEXITY_KEY = os.getenv("PERPLEXITY_API_KEY", "").replace('"', '').replace("'", "").strip()
 
 if not DB_URL:
     print("❌ ERRO: DATABASE_URL não definida!")
@@ -21,8 +23,7 @@ if not DB_URL:
 engine = create_engine(DB_URL)
 
 def ensure_schema():
-    """Garante schema do banco"""
-    print("🔧 Verificando schema do banco...")
+    print("🔧 Verificando schema...")
     with engine.begin() as conn:
         try:
             conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS price DECIMAL(18, 2) DEFAULT 0;"))
@@ -35,25 +36,23 @@ def ensure_schema():
             print(f"⚠️ Aviso schema: {e}")
 
 def get_ai_analysis(ticker, info):
-    """Tenta múltiplos modelos do Google até um funcionar"""
-    if not GEMINI_KEY: return "Chave Gemini ausente."
-    
-    # LISTA DE TENTATIVAS (Do mais novo para o mais clássico)
-    models = [
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-001",
-        "gemini-1.5-flash-latest",
-        "gemini-1.5-pro",
-        "gemini-pro" # Esse costuma ser infalível
+    """Raio-X: Retorna o erro exato do Google para o Frontend"""
+    if not GEMINI_KEY: return "ERRO: Chave Gemini vazia."
+    if len(GEMINI_KEY) < 10: return "ERRO: Chave Gemini parece inválida (curta)."
+
+    # Tenta endpoints diferentes (v1 é mais estável que v1beta)
+    attempts = [
+        ("v1beta", "gemini-1.5-flash"),
+        ("v1", "gemini-1.5-flash"),
+        ("v1beta", "gemini-pro")
     ]
     
-    prompt = f"""
-    Ativo: {ticker}. Preço: R$ {info.get('currentPrice', 0)}. P/L: {info.get('trailingPE', 'N/A')}.
-    Responda em 1 frase curta (PT-BR): O valuation está atrativo?
-    """
+    last_error = ""
     
-    for model in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+    prompt = f"""Ativo: {ticker}. Preço: {info.get('currentPrice')}. P/L: {info.get('trailingPE')}. Vale a pena? (1 frase)"""
+    
+    for version, model in attempts:
+        url = f"https://generativelanguage.googleapis.com/{version}/models/{model}:generateContent?key={GEMINI_KEY}"
         headers = {'Content-Type': 'application/json'}
         data = {"contents": [{"parts": [{"text": prompt}]}]}
         
@@ -61,53 +60,54 @@ def get_ai_analysis(ticker, info):
             response = requests.post(url, headers=headers, json=data, timeout=10)
             
             if response.status_code == 200:
-                # SUCESSO! Retorna o texto e para de tentar
-                return response.json()['candidates'][0]['content']['parts'][0]['text']
-            elif response.status_code == 404:
-                # Modelo não encontrado, tenta o próximo silenciosamente
-                continue
+                try:
+                    return response.json()['candidates'][0]['content']['parts'][0]['text']
+                except:
+                    return "Erro: JSON do Google ilegível."
             else:
-                print(f"⚠️ Erro {model}: {response.status_code}")
+                # SALVA O ERRO PARA VOCÊ LER NO SITE
+                error_json = response.json()
+                msg = error_json.get('error', {}).get('message', 'Sem msg')
+                last_error = f"Google {response.status_code}: {msg}"
                 
         except Exception as e:
-            print(f"⚠️ Erro conexão {model}: {e}")
-            
-    return "IA indisponível (Todos modelos falharam)."
+            last_error = f"Crash: {str(e)[:50]}"
+
+    return f"FALHA: {last_error[:100]}" # Corta para caber na tabela
 
 def get_news_from_perplexity(ticker):
-    """Busca notícias via Perplexity"""
-    if not PERPLEXITY_KEY: return "Chave News ausente."
+    if not PERPLEXITY_KEY: return "ERRO: Chave News vazia."
     
     url = "https://api.perplexity.ai/chat/completions"
     payload = {
         "model": "llama-3.1-sonar-small-128k-online",
-        "messages": [{"role": "user", "content": f"Manchete mais importante sobre {ticker} hoje (max 10 palavras)."}]
+        "messages": [{"role": "user", "content": f"Manchete {ticker} hoje (10 palavras)."}]
     }
     headers = {"Authorization": f"Bearer {PERPLEXITY_KEY}", "Content-Type": "application/json"}
     
     try:
         res = requests.post(url, json=payload, headers=headers).json()
+        if 'error' in res:
+             return f"Erro API News: {res['error']['message']}"
         if 'choices' in res:
             return res['choices'][0]['message']['content']
-        return "Sem notícias relevantes."
+        return "Sem dados retornados."
     except Exception as e:
-        print(f"⚠️ Erro Perplexity ({ticker}): {e}")
-        return "Erro nas notícias."
+        return f"Erro News: {str(e)[:30]}"
 
 def fix_ticker(ticker):
     ticker = ticker.upper().strip()
-    if not ticker.endswith(".SA") and len(ticker) <= 6:
-        return ticker + ".SA"
+    if not ticker.endswith(".SA") and len(ticker) <= 6: return ticker + ".SA"
     return ticker
 
 def run_market_update():
-    print(f"\n--- 🚀 Inteligência V6 (Chave Mestra): {datetime.now()} ---")
+    print(f"\n--- 🚀 Inteligência Raio-X: {datetime.now()} ---")
     
     try:
         with engine.connect() as conn:
             assets = conn.execute(text("SELECT id, ticker FROM assets")).fetchall()
     except Exception as e:
-        print(f"❌ Erro Conexão Banco: {e}")
+        print(f"❌ Erro Banco: {e}")
         return
 
     for asset in assets:
@@ -123,11 +123,9 @@ def run_market_update():
                 print("⚠️ Sem preço.")
                 continue
 
-            # IA com Retry
             analysis = get_ai_analysis(real_ticker, info)
             news = get_news_from_perplexity(real_ticker)
             
-            # Salva
             with engine.begin() as conn:
                 sql = text("""
                     UPDATE assets SET 
@@ -143,7 +141,7 @@ def run_market_update():
                     "news": news,
                     "aid": asset.id
                 })
-            print(f"✅ R$ {current_price} | IA: {analysis[:15]}...")
+            print(f"✅ R$ {current_price} | Msg: {analysis[:20]}...")
             
         except Exception as e:
             print(f"❌ Erro: {e}")
