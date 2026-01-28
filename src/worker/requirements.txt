@@ -1,11 +1,8 @@
-# Bibliotecas de Finanças e Dados
-yfinance==0.2.36
-pandas==2.2.0
-sqlalchemy==2.0.25
-psycopg2-binary==2.9.9
-schedule==1.2.1
-python-dotenv==1.0.1
-
-# Bibliotecas de Inteligência Artificial (O que provavelmente falta)
-google-generativeai==0.3.2
-requests==2.31.0
+yfinance
+pandas
+sqlalchemy
+psycopg2-binary
+schedule
+google-generativeai
+requests
+python-dotenv
