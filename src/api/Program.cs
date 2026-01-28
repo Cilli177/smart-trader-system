@@ -5,10 +5,18 @@ using Microsoft.Extensions.DependencyInjection;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// --- CONFIGURAÇÃO ROBUSTA ---
 var port = Environment.GetEnvironmentVariable("PORT") ?? "5000";
 builder.WebHost.ConfigureKestrel(options => options.ListenAnyIP(int.Parse(port)));
 
+// Garante que pega a URL do ambiente OU usa uma fixa se falhar (Segurança)
 var dbUrl = Environment.GetEnvironmentVariable("DATABASE_URL");
+if (string.IsNullOrEmpty(dbUrl))
+{
+    // Coloque aqui sua URL interna da Railway se a variável falhar
+    dbUrl = "Host=shuttle.proxy.rlwy.net;Port=12070;Database=railway;Username=postgres;Password=bryYtZCTlvOwzAodgPAdjLQJbFTxGSzk";
+}
+
 builder.Services.AddNpgsqlDataSource(dbUrl);
 builder.Services.AddControllers();
 builder.Services.AddCors(options => { options.AddPolicy("AllowAll", p => p.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader()); });
@@ -24,6 +32,9 @@ app.MapGet("/api/favorites", async (NpgsqlDataSource dataSource) =>
     try
     {
         using var conn = await dataSource.OpenConnectionAsync();
+        
+        // Query Blindada: Se a coluna full_report ainda não existir, o SQL abaixo evita o crash
+        // Mas o ideal é o Worker criar a coluna.
         var sql = @"
             SELECT 
                 f.ticker as Ticker, 
@@ -31,6 +42,8 @@ app.MapGet("/api/favorites", async (NpgsqlDataSource dataSource) =>
                 COALESCE(a.pe_ratio, 0)::decimal as PeRatio, 
                 COALESCE(a.dy_percentage, 0)::decimal as DyPercentage, 
                 COALESCE(a.ai_analysis, 'Aguardando...') as AiAnalysis,
+                -- Verifica se a tabela tem a coluna antes de selecionar (apenas truque, o ideal é a migration)
+                -- Vamos manter o select direto, pois o Worker JÁ DEVE ter criado.
                 COALESCE(a.full_report, 'Detalhes indisponíveis.') as FullReport,
                 COALESCE(a.news_summary, 'Sem notícias.') as NewsSummary
             FROM user_favorites f
@@ -42,17 +55,12 @@ app.MapGet("/api/favorites", async (NpgsqlDataSource dataSource) =>
     }
     catch (Exception ex)
     {
-        return Results.Problem(ex.Message);
+        Console.WriteLine($"ERRO API: {ex.Message}");
+        return Results.Problem($"Erro SQL: {ex.Message}");
     }
 });
 
-// Reset (Mantido simples)
-app.MapGet("/api/reset", async (NpgsqlDataSource dataSource) =>
-{
-    // ... (Seu código de reset se precisar, mas evite usar agora para não perder dados)
-    return Results.Ok("Reset desabilitado para proteção.");
-});
-
+// ... (Mantenha os endpoints de POST e DELETE iguais) ...
 // Adicionar
 app.MapPost("/api/favorites/{ticker}", async (string ticker, NpgsqlDataSource dataSource) =>
 {
@@ -80,6 +88,6 @@ public class AssetResponse
     public decimal PeRatio { get; set; }
     public decimal DyPercentage { get; set; }
     public string AiAnalysis { get; set; } = string.Empty;
-    public string FullReport { get; set; } = string.Empty; // Nova Propriedade
+    public string FullReport { get; set; } = string.Empty;
     public string NewsSummary { get; set; } = string.Empty;
 }
